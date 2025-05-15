@@ -1,0 +1,7 @@
+**/target
+**/Cargo.lock
+*.json
+*.profraw
+.idea
+.vscode
+.DS_Store
