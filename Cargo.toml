@@ -13,7 +13,7 @@ name = "server"
 
 [package.metadata.prosa.hyper_srv]
 proc = "server::proc::HyperServerProc"
-settings = "server::proc::HyperServerProcSettings"
+settings = "server::proc::HyperServerSettings"
 adaptor = ["server::adaptor::HelloHyperServerAdaptor"]
 
 [dependencies]
