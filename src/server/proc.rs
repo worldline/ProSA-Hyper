@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{env, sync::Arc, time::Duration};
 
 use hyper::server::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -36,7 +36,12 @@ pub struct HyperServerSettings {
 
 impl HyperServerSettings {
     fn default_listener() -> ListenerSetting {
-        ListenerSetting::new(Url::parse("http://0.0.0.0:8080").unwrap(), None)
+        let mut url = Url::parse("http://0.0.0.0:8080").unwrap();
+        if let Ok(Ok(port)) = env::var("PORT").map(|p| p.parse::<u16>()) {
+            url.set_port(Some(port)).unwrap();
+        }
+
+        ListenerSetting::new(url, None)
     }
 
     /// Create a new Hyper Server settings
