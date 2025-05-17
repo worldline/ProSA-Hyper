@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use bytes::Bytes;
 use http_body_util::{Full, combinators::BoxBody};
 use hyper::{Request, Response, body::Body};
-use prosa::core::error::ProcError;
+use prosa::core::{adaptor::Adaptor, error::ProcError};
 
 use crate::HyperResp;
 
@@ -63,6 +63,7 @@ where
 }
 
 /// Hello adaptor for the Hyper server processor. Use to respond to a request with a simple hello message
+#[derive(Debug, Adaptor, Clone)]
 pub struct HelloHyperServerAdaptor {
     hello_msg: String,
 }

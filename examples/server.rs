@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 /// Demo Hyper processor adaptor
-#[derive(Default, Debug, Adaptor, Clone)]
+#[derive(Debug, Adaptor, Clone)]
 pub struct HyperDemoAdaptor {
     prosa_name: String,
 }
