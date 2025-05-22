@@ -23,7 +23,8 @@ http_server:
   listener:
     url: https://0.0.0.0:443
     ssl:
-      store: cert_path/
+      store:
+        path: "cert_path/"
       cert: cert.pem
       key: key.pem
       passphrase: MySuperPassphrase
