@@ -118,7 +118,7 @@ where
 mod tests {
     use bytes::Bytes;
     use http_body_util::{Full, combinators::BoxBody};
-    use hyper::{Request, Response, StatusCode, body::Body};
+    use hyper::{Request, Response, StatusCode};
     use openssl::{
         asn1::{Asn1Integer, Asn1Time},
         bn::{BigNum, MsbOption},
@@ -210,10 +210,11 @@ mod tests {
             Ok(ServerTestAdaptor {})
         }
 
-        async fn process_http_request<B>(&self, _req: Request<B>, h2: bool) -> HyperResp<M>
-        where
-            B: Body + 'static,
-        {
+        async fn process_http_request(
+            &self,
+            _req: Request<hyper::body::Incoming>,
+            h2: bool,
+        ) -> HyperResp<M> {
             let resp_msg = if h2 {
                 "Hello, H2 world"
             } else {

@@ -3,7 +3,7 @@ use std::convert::Infallible;
 
 use bytes::Bytes;
 use http_body_util::{Full, combinators::BoxBody};
-use hyper::{Request, Response, body::Body};
+use hyper::{Request, Response};
 use prosa::core::{adaptor::Adaptor, error::ProcError};
 
 use crate::HyperResp;
@@ -51,13 +51,12 @@ where
         Self: Sized;
 
     /// Method to process input HTTP requests. Received by the ProSA through Hyper
-    fn process_http_request<B>(
+    fn process_http_request(
         &self,
-        req: Request<B>,
+        req: Request<hyper::body::Incoming>,
         h2: bool,
-    ) -> impl std::future::Future<Output = HyperResp<M>> + Send
-    where
-        B: Body + 'static + std::marker::Send;
+    ) -> impl std::future::Future<Output = HyperResp<M>> + Send;
+
     /// Method to process input response to respond with an Hyper HTTP response.
     fn process_srv_response(&self, resp: &M) -> Response<BoxBody<Bytes, Infallible>>;
 }
@@ -88,10 +87,11 @@ where
         })
     }
 
-    async fn process_http_request<B>(&self, _req: Request<B>, _h2: bool) -> HyperResp<M>
-    where
-        B: Body + 'static + std::marker::Send,
-    {
+    async fn process_http_request(
+        &self,
+        _req: Request<hyper::body::Incoming>,
+        _h2: bool,
+    ) -> HyperResp<M> {
         HyperResp::<M>::HttpResp(
             Response::builder()
                 .status(200)

@@ -9,7 +9,7 @@ use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{Empty, Full};
 use hyper::service::Service;
-use hyper::{Request, Response, body::Incoming as IncomingBody};
+use hyper::{Request, Response};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use prosa::core::msg::{InternalMsg, Msg};
@@ -73,7 +73,7 @@ where
         adaptor: A,
         proc_queue: mpsc::Sender<HyperProcMsg<M>>,
         h2: bool,
-        req: Request<IncomingBody>,
+        req: Request<hyper::body::Incoming>,
         metric_counter: Counter<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, hyper::Error> {
         match adaptor.process_http_request(req, h2).await {
@@ -171,7 +171,7 @@ where
     }
 }
 
-impl<A, M> Service<Request<IncomingBody>> for HyperService<A, M>
+impl<A, M> Service<Request<hyper::body::Incoming>> for HyperService<A, M>
 where
     A: 'static + HyperServerAdaptor<M> + Clone + std::marker::Sync + std::marker::Send,
     M: 'static
@@ -187,7 +187,7 @@ where
     type Error = hyper::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-    fn call(&self, req: Request<IncomingBody>) -> Self::Future {
+    fn call(&self, req: Request<hyper::body::Incoming>) -> Self::Future {
         Box::pin(HyperService::<A, M>::process_call(
             self.adaptor.clone(),
             self.proc_queue.clone(),

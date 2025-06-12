@@ -7,7 +7,6 @@ use clap::{ArgAction, Command, arg};
 use config::Config;
 use http_body_util::Full;
 use http_body_util::combinators::BoxBody;
-use hyper::body::Body;
 use hyper::{Request, Response};
 use prosa::core::adaptor::Adaptor;
 use prosa::core::error::ProcError;
@@ -50,10 +49,11 @@ where
         })
     }
 
-    async fn process_http_request<B>(&self, req: Request<B>, h2: bool) -> crate::HyperResp<M>
-    where
-        B: Body + 'static + std::marker::Send,
-    {
+    async fn process_http_request(
+        &self,
+        req: Request<hyper::body::Incoming>,
+        h2: bool,
+    ) -> crate::HyperResp<M> {
         match req.uri().path() {
             "/" => HyperResp::HttpResp(
                 Response::builder()
