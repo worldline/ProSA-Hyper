@@ -97,7 +97,7 @@ where
         &mut self.span
     }
 
-    fn enter_span(&self) -> span::Entered {
+    fn enter_span(&self) -> span::Entered<'_> {
         self.span.enter()
     }
 
