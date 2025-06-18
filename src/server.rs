@@ -176,7 +176,10 @@ mod tests {
 
     impl HttpTestSettings {
         fn new(url: Url, server_ssl: Option<SslConfig>) -> Self {
-            let server = HyperServerSettings::new(ListenerSetting::new(url.clone(), server_ssl));
+            let server = HyperServerSettings::new(
+                ListenerSetting::new(url.clone(), server_ssl),
+                Duration::from_secs(1),
+            );
             HttpTestSettings {
                 server,
                 ..Default::default()

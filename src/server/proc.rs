@@ -32,6 +32,9 @@ pub struct HyperServerSettings {
     /// Listener settings
     #[serde(default = "HyperServerSettings::default_listener")]
     pub listener: ListenerSetting,
+    /// Timeout for internal service requests
+    #[serde(default = "HyperServerSettings::default_service_timeout")]
+    pub service_timeout: Duration,
 }
 
 impl HyperServerSettings {
@@ -44,10 +47,15 @@ impl HyperServerSettings {
         ListenerSetting::new(url, None)
     }
 
+    fn default_service_timeout() -> Duration {
+        Duration::from_millis(800)
+    }
+
     /// Create a new Hyper Server settings
-    pub fn new(listener: ListenerSetting) -> HyperServerSettings {
+    pub fn new(listener: ListenerSetting, service_timeout: Duration) -> HyperServerSettings {
         HyperServerSettings {
             listener,
+            service_timeout,
             ..Default::default()
         }
     }
@@ -58,6 +66,7 @@ impl Default for HyperServerSettings {
     fn default() -> HyperServerSettings {
         HyperServerSettings {
             listener: Self::default_listener(),
+            service_timeout: Self::default_service_timeout(),
         }
     }
 }
@@ -155,7 +164,7 @@ where
                     if let Some(service) = self.service.get_proc_service(&service_name, message_ref_request) {
                         debug!("The service is find: {service:?}, send to the internal service");
                         service.proc_queue.send(InternalMsg::Request(RequestMsg::new(message_ref_request, service_name, http_msg.get_data().clone(), self.proc.get_service_queue().clone()))).await.unwrap();
-                        pending_req.push_with_id(message_ref_request, http_msg, Duration::from_millis(800));
+                        pending_req.push_with_id(message_ref_request, http_msg, self.settings.service_timeout);
 
                         message_ref_request += 1;
                     } else {
@@ -221,7 +230,7 @@ where
                     let service_name = msg.get_service().clone();
                     let span_msg = msg.get_span().clone();
                     let origin_data = msg.get_data().clone();
-                    let _ = msg.response_queue.send(InternalMsg::Error(ErrorMsg::new(0, service_name.clone(), span_msg, origin_data, ServiceError::Timeout(service_name, 800))));
+                    let _ = msg.response_queue.send(InternalMsg::Error(ErrorMsg::new(0, service_name.clone(), span_msg, origin_data, ServiceError::Timeout(service_name, self.settings.service_timeout.as_millis() as u64))));
                 },
             }
         }
