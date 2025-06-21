@@ -126,6 +126,7 @@ where
             .init();
 
         let listener = Arc::new(self.settings.listener.bind().await?);
+        let service_adaptor = Arc::new(adaptor.clone());
         info!("Listening on {:?}", listener.local_addr());
         loop {
             tokio::select! {
@@ -176,7 +177,7 @@ where
                     let (stream, addr) = accept_result?;
 
                     let listener = listener.clone();
-                    let adaptor = adaptor.clone();
+                    let service_adaptor = service_adaptor.clone();
                     let http_tx = http_tx.clone();
                     let http_counter = observable_http_counter.clone();
                     let http_socket = observable_http_socket.clone();
@@ -200,7 +201,7 @@ where
                                     if let Err(err) = http2::Builder::new(TokioExecutor::new())
                                         .serve_connection(
                                             io,
-                                            HyperService::new(adaptor, http_tx, true, http_counter),
+                                            HyperService::new(service_adaptor, http_tx, true, http_counter),
                                         )
                                         .await
                                     {
@@ -209,7 +210,7 @@ where
                                 } else if let Err(err) = http1::Builder::new()
                                     .serve_connection(
                                         io,
-                                        HyperService::new(adaptor, http_tx, false, http_counter),
+                                        HyperService::new(service_adaptor, http_tx, false, http_counter),
                                     )
                                     .await
                                 {

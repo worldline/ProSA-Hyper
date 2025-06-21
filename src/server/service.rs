@@ -2,8 +2,8 @@
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::marker;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -24,7 +24,7 @@ use super::adaptor::HyperServerAdaptor;
 /// Struct to define parameters for a service (HTTP server)
 pub(crate) struct HyperService<A, M>
 where
-    A: 'static + HyperServerAdaptor<M> + Clone,
+    A: 'static + HyperServerAdaptor<M>,
     M: 'static
         + std::marker::Send
         + std::marker::Sync
@@ -34,11 +34,10 @@ where
         + prosa_utils::msg::tvf::Tvf
         + std::default::Default,
 {
-    adaptor: A,
+    adaptor: Arc<A>,
     proc_queue: mpsc::Sender<HyperProcMsg<M>>,
     h2: bool,
     metric_counter: Counter<u64>,
-    _msg: marker::PhantomData<M>,
 }
 
 impl<A, M> HyperService<A, M>
@@ -55,7 +54,7 @@ where
 {
     /// Method to create an Hyper service
     pub(crate) fn new(
-        adaptor: A,
+        adaptor: Arc<A>,
         proc_queue: mpsc::Sender<HyperProcMsg<M>>,
         h2: bool,
         metric_counter: Counter<u64>,
@@ -65,12 +64,11 @@ where
             proc_queue,
             h2,
             metric_counter,
-            _msg: marker::PhantomData::<M>,
         }
     }
 
     async fn process_call(
-        adaptor: A,
+        adaptor: Arc<A>,
         proc_queue: mpsc::Sender<HyperProcMsg<M>>,
         h2: bool,
         req: Request<hyper::body::Incoming>,
@@ -117,7 +115,7 @@ where
 
     /// Method to wait for response send by the ProSA HTTP processor
     async fn wait_intern_resp(
-        adaptor: A,
+        adaptor: Arc<A>,
         proc_queue: mpsc::Sender<HyperProcMsg<M>>,
         service_name: String,
         request: M,
