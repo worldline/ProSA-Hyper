@@ -197,11 +197,12 @@ where
                                 http_socket.add(1, &[KeyValue::new("version", if is_http2 { "HTTP/2" } else { "HTTP/1.1" })]);
 
                                 let io = TokioIo::new(stream);
+                                let service = HyperService::new(service_adaptor, http_tx, http_counter);
                                 if is_http2 {
                                     if let Err(err) = http2::Builder::new(TokioExecutor::new())
                                         .serve_connection(
                                             io,
-                                            HyperService::new(service_adaptor, http_tx, true, http_counter),
+                                            service,
                                         )
                                         .await
                                     {
@@ -210,7 +211,7 @@ where
                                 } else if let Err(err) = http1::Builder::new()
                                     .serve_connection(
                                         io,
-                                        HyperService::new(service_adaptor, http_tx, false, http_counter),
+                                        service,
                                     )
                                     .await
                                 {

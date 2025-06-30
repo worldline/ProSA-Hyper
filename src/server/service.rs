@@ -36,7 +36,6 @@ where
 {
     adaptor: Arc<A>,
     proc_queue: mpsc::Sender<HyperProcMsg<M>>,
-    h2: bool,
     metric_counter: Counter<u64>,
 }
 
@@ -56,13 +55,11 @@ where
     pub(crate) fn new(
         adaptor: Arc<A>,
         proc_queue: mpsc::Sender<HyperProcMsg<M>>,
-        h2: bool,
         metric_counter: Counter<u64>,
     ) -> HyperService<A, M> {
         HyperService {
             adaptor,
             proc_queue,
-            h2,
             metric_counter,
         }
     }
@@ -70,11 +67,10 @@ where
     async fn process_call(
         adaptor: Arc<A>,
         proc_queue: mpsc::Sender<HyperProcMsg<M>>,
-        h2: bool,
         req: Request<hyper::body::Incoming>,
         metric_counter: Counter<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, hyper::Error> {
-        match adaptor.process_http_request(req, h2).await {
+        match adaptor.process_http_request(req).await {
             crate::HyperResp::SrvReq(srv_name, req) => {
                 let resp =
                     HyperService::<A, M>::wait_intern_resp(adaptor, proc_queue, srv_name, req)
@@ -101,13 +97,7 @@ where
                 Ok(res)
             }
             crate::HyperResp::HttpErr(err) => {
-                metric_counter.add(
-                    1,
-                    &[
-                        KeyValue::new("code", 503),
-                        KeyValue::new("version", if h2 { "HTTP/2" } else { "HTTP/1.1" }),
-                    ],
-                );
+                metric_counter.add(1, &[KeyValue::new("code", 503)]);
                 Err(err)
             }
         }
@@ -189,7 +179,6 @@ where
         Box::pin(HyperService::<A, M>::process_call(
             self.adaptor.clone(),
             self.proc_queue.clone(),
-            self.h2,
             req,
             self.metric_counter.clone(),
         ))

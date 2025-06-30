@@ -14,6 +14,7 @@ use prosa::core::main::MainRunnable as _;
 use prosa::core::proc::{Proc, ProcConfig};
 use prosa::core::settings::settings;
 use prosa::stub::adaptor::StubParotAdaptor;
+use prosa::stub::proc::StubSettings;
 use prosa::{core::main::MainProc, stub::proc::StubProc};
 use prosa_hyper::HyperResp;
 use prosa_hyper::server::adaptor::HyperServerAdaptor;
@@ -52,14 +53,17 @@ where
     async fn process_http_request(
         &self,
         req: Request<hyper::body::Incoming>,
-        h2: bool,
     ) -> crate::HyperResp<M> {
         match req.uri().path() {
             "/" => HyperResp::HttpResp(
                 Response::builder()
                     .body(BoxBody::new(Full::new(Bytes::from(format!(
                         "{} - Home of {}",
-                        if h2 { "H2" } else { "HTTP/1.1" },
+                        if req.version() == hyper::Version::HTTP_2 {
+                            "H2"
+                        } else {
+                            "HTTP/1.1"
+                        },
                         self.prosa_name,
                     )))))
                     .unwrap(),
@@ -106,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .arg(arg!(-v - -verbose).action(ArgAction::SetTrue))
         .arg(arg!(-s --stub "Start a Stub processor").action(ArgAction::SetTrue))
         .arg(
-            arg!(-c --config <CONFIG_PATH> "Path of the JPTR ProSA configuration file")
+            arg!(-c --config <CONFIG_PATH> "Path of the Hyper ProSA server configuration file")
                 .default_value("examples/server.yml"),
         )
         .get_matches();
@@ -146,8 +150,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if matches.contains_id("stub") && matches.get_flag("stub") {
         debug!("Start a Stub processor");
-        // TODO add the SRV_TEST service
-        let stub_proc = StubProc::<SimpleStringTvf>::create_raw(2, bus.clone());
+        let stub_settings = StubSettings::new(vec![String::from("SRV_TEST")]);
+        let stub_proc = StubProc::<SimpleStringTvf>::create(2, bus.clone(), stub_settings);
         Proc::<StubParotAdaptor>::run(stub_proc, String::from("STUB_PROC"));
     }
 

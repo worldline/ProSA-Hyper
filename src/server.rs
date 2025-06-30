@@ -47,7 +47,7 @@ where
         + prosa_utils::msg::tvf::Tvf
         + std::default::Default,
 {
-    /// Create a new Hyper processor
+    /// Create a new Hyper processor message
     pub fn new(
         service: String,
         data: M,
@@ -213,12 +213,8 @@ mod tests {
             Ok(ServerTestAdaptor {})
         }
 
-        async fn process_http_request(
-            &self,
-            _req: Request<hyper::body::Incoming>,
-            h2: bool,
-        ) -> HyperResp<M> {
-            let resp_msg = if h2 {
+        async fn process_http_request(&self, req: Request<hyper::body::Incoming>) -> HyperResp<M> {
+            let resp_msg = if req.version() == hyper::Version::HTTP_2 {
                 "Hello, H2 world"
             } else {
                 "Hello, world"

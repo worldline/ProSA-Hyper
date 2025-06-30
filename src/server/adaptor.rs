@@ -54,7 +54,6 @@ where
     fn process_http_request(
         &self,
         req: Request<hyper::body::Incoming>,
-        h2: bool,
     ) -> impl std::future::Future<Output = HyperResp<M>> + Send;
 
     /// Method to process input response to respond with an Hyper HTTP response.
@@ -87,11 +86,7 @@ where
         })
     }
 
-    async fn process_http_request(
-        &self,
-        _req: Request<hyper::body::Incoming>,
-        _h2: bool,
-    ) -> HyperResp<M> {
+    async fn process_http_request(&self, _req: Request<hyper::body::Incoming>) -> HyperResp<M> {
         HyperResp::<M>::HttpResp(
             Response::builder()
                 .status(200)
