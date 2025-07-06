@@ -15,6 +15,10 @@ pub mod proc;
 /// Hyper service definition
 pub(crate) mod service;
 
+#[cfg(feature = "mcp-server")]
+/// ProSA MCP server module
+pub mod mcp;
+
 /// Hyper processor
 #[derive(Debug)]
 pub struct HyperProcMsg<M>
