@@ -1,0 +1,31 @@
+
+hyper:
+  listener:
+    url: https://0.0.0.0:8443
+    max_socket: 20
+
+observability:
+  level: DEBUG
+  metrics:
+    #otlp: # Opentelemetry protocol
+    #  endpoint: "http://localhost:4137"
+    #  timeout_sec: 3
+    #  protocol: Grpc
+    prometheus:
+      endpoint: "0.0.0.0:9090"
+    stdout:
+      level: debug
+  traces:
+    #otlp: # Opentelemetry protocol
+    #  endpoint: "http://localhost:4137"
+    #  timeout_sec: 3
+    #  protocol: Grpc
+    stdout:
+      level: debug
+  logs:
+    #otlp: # Opentelemetry protocol
+    #  endpoint: "http://localhost:4137"
+    #  timeout_sec: 3
+    #  protocol: Grpc
+    stdout:
+      level: debug
