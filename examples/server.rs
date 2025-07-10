@@ -5,8 +5,8 @@ use std::env;
 use bytes::Bytes;
 use clap::{ArgAction, Command, arg};
 use config::Config;
-use http_body_util::Full;
 use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt as _, Full};
 use hyper::{Request, Response};
 use prosa::core::adaptor::Adaptor;
 use prosa::core::error::ProcError;
@@ -72,6 +72,11 @@ where
                 let mut tvf_req = M::default();
                 tvf_req.put_string(1, req.method().to_string());
                 tvf_req.put_string(2, "/test");
+
+                if let Ok(_body) = req.collect().await.map(|b| b.aggregate()) {
+                    // should work
+                }
+
                 HyperResp::SrvReq(String::from("SRV_TEST"), tvf_req)
             }
             _ => HyperResp::HttpResp(
@@ -103,6 +108,9 @@ pub(crate) struct MainHyperSettings {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(all(debug_assertions, feature = "subsecond"))]
+    dioxus_devtools::connect_subsecond();
+
     let matches = Command::new("hyper")
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))

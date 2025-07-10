@@ -70,7 +70,16 @@ where
         req: Request<hyper::body::Incoming>,
         metric_counter: Counter<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, hyper::Error> {
-        match adaptor.process_http_request(req).await {
+        #[cfg(all(debug_assertions, feature = "subsecond"))]
+        let res = subsecond::call(|| {
+            Box::pin(adaptor.process_http_request(req))
+                as Pin<Box<dyn Future<Output = crate::HyperResp<M>> + Send>>
+        })
+        .await;
+        #[cfg(not(all(debug_assertions, feature = "subsecond")))]
+        let res = adaptor.process_http_request(req).await;
+
+        match res {
             crate::HyperResp::SrvReq(srv_name, req) => {
                 let resp =
                     HyperService::<A, M>::wait_intern_resp(adaptor, proc_queue, srv_name, req)

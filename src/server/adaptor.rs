@@ -103,3 +103,27 @@ where
         panic!("No message should be send to an external service")
     }
 }
+
+// Not working
+/*impl<M> subsecond::HotFunction<Request<hyper::body::Incoming>, std::marker::PhantomData<M>> for HelloHyperServerAdaptor
+where
+    M: 'static
+        + std::marker::Send
+        + std::marker::Sync
+        + std::marker::Sized
+        + std::clone::Clone
+        + std::fmt::Debug
+        + prosa_utils::msg::tvf::Tvf
+        + std::default::Default,
+{
+    type Return = std::pin::Pin<Box<dyn Future<Output = crate::HyperResp<M>> + Send>>;
+    type Real = fn(Request<hyper::body::Incoming>) -> std::pin::Pin<Box<dyn Future<Output = crate::HyperResp<M>> + Send>>;
+
+    fn call_it(&mut self, args: Request<hyper::body::Incoming>) -> Self::Return {
+        Box::pin(self.process_http_request(args))
+    }
+
+    unsafe fn call_as_ptr(&mut self, _args: Request<hyper::body::Incoming>) -> Self::Return {
+        unimplemented!("HotFunction::call_as_ptr is not implemented for HelloHyperServerAdaptor");
+    }
+}*/

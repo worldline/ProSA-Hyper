@@ -57,4 +57,5 @@ pub enum HyperResp<M> {
     HttpErr(hyper::Error),
 }
 
+#[cfg(feature = "server")]
 pub mod server;
