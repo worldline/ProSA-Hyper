@@ -71,11 +71,15 @@ where
         metric_counter: Counter<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, hyper::Error> {
         #[cfg(all(debug_assertions, feature = "subsecond"))]
-        let res = subsecond::call(|| {
-            Box::pin(adaptor.process_http_request(req))
-                as Pin<Box<dyn Future<Output = crate::HyperResp<M>> + Send>>
-        })
-        .await;
+        let res = {
+            let mut req = Some(req);
+            subsecond::call(|| {
+                let req = req.take().expect("req should only be taken once");
+                Box::pin(adaptor.process_http_request(req))
+                    as Pin<Box<dyn Future<Output = crate::HyperResp<M>> + Send>>
+            })
+            .await
+        };
         #[cfg(not(all(debug_assertions, feature = "subsecond")))]
         let res = adaptor.process_http_request(req).await;
 
