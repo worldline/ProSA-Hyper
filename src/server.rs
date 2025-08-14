@@ -2,7 +2,10 @@
 
 use std::time::{Duration, SystemTime};
 
-use prosa::core::msg::{InternalMsg, Msg};
+use prosa::core::{
+    error::BusError,
+    msg::{InternalMsg, Msg},
+};
 
 use tokio::sync::oneshot;
 
@@ -31,9 +34,9 @@ where
     id: u64,
     span: Span,
     service: String,
-    data: M,
+    data: Option<M>,
     begin_time: SystemTime,
-    response_queue: oneshot::Sender<InternalMsg<M>>,
+    response_queue: Option<oneshot::Sender<InternalMsg<M>>>,
 }
 
 impl<M> HyperProcMsg<M>
@@ -58,15 +61,22 @@ where
             id: 0,
             service,
             span,
-            data,
+            data: Some(data),
             begin_time: SystemTime::now(),
-            response_queue,
+            response_queue: Some(response_queue),
         }
     }
 
     /// Set the ID of the Hyper processor
     pub fn set_id(&mut self, id: u64) {
         self.id = id;
+    }
+
+    /// Get the response queue to respond to the message
+    pub fn get_response_queue(&mut self) -> Result<oneshot::Sender<InternalMsg<M>>, BusError> {
+        self.response_queue
+            .take()
+            .ok_or(BusError::InternalQueue("HyperProcMsg".to_string()))
     }
 }
 
@@ -101,16 +111,27 @@ where
         self.span.enter()
     }
 
-    fn get_data(&self) -> &M {
-        &self.data
+    fn get_data(&self) -> Result<&M, BusError> {
+        self.data.as_ref().ok_or(BusError::NoData)
     }
 
-    fn get_data_mut(&mut self) -> &mut M {
-        &mut self.data
+    fn get_data_mut(&mut self) -> Result<&mut M, BusError> {
+        self.data.as_mut().ok_or(BusError::NoData)
     }
 
     fn elapsed(&self) -> Duration {
         self.begin_time.elapsed().unwrap_or(Duration::new(0, 0))
+    }
+
+    fn take_data(&mut self) -> Option<M> {
+        self.data.take()
+    }
+
+    fn take_data_if<P>(&mut self, predicate: P) -> Option<M>
+    where
+        P: FnOnce(&mut M) -> bool,
+    {
+        self.data.take_if(predicate)
     }
 }
 
@@ -233,7 +254,7 @@ mod tests {
 
         fn process_srv_response(
             &self,
-            _resp: &M,
+            _resp: M,
         ) -> hyper::Response<
             http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>,
         > {

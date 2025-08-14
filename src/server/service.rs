@@ -117,7 +117,17 @@ where
 
         match resp_rx.await {
             Ok(msg) => match msg {
-                InternalMsg::Response(msg) => Ok(adaptor.process_srv_response(msg.get_data())),
+                InternalMsg::Response(mut msg) => {
+                    if let Some(data) = msg.take_data() {
+                        Ok(adaptor.process_srv_response(data))
+                    } else {
+                        Ok(Response::builder()
+                            .status(500)
+                            .header("Server", A::SERVER_HEADER)
+                            .body(BoxBody::new(Full::new(Bytes::from("Missing data"))))
+                            .unwrap())
+                    }
+                }
                 InternalMsg::Error(err) => match err.get_err() {
                     prosa::core::service::ServiceError::NoError(_) => Ok(Response::builder()
                         .status(202)
