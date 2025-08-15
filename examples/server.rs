@@ -83,7 +83,7 @@ where
         }
     }
 
-    fn process_srv_response(&self, resp: &M) -> Response<BoxBody<Bytes, Infallible>> {
+    fn process_srv_response(&self, resp: M) -> Response<BoxBody<Bytes, Infallible>> {
         let body = resp
             .get_string(10)
             .unwrap_or(Cow::Owned(String::from("empty body")));
@@ -157,6 +157,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait on main task
     main_task.await;
-    opentelemetry::global::shutdown_tracer_provider();
     Ok(())
 }

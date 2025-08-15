@@ -57,7 +57,7 @@ where
     ) -> impl std::future::Future<Output = HyperResp<M>> + Send;
 
     /// Method to process input response to respond with an Hyper HTTP response.
-    fn process_srv_response(&self, resp: &M) -> Response<BoxBody<Bytes, Infallible>>;
+    fn process_srv_response(&self, resp: M) -> Response<BoxBody<Bytes, Infallible>>;
 }
 
 /// Hello adaptor for the Hyper server processor. Use to respond to a request with a simple hello message
@@ -99,7 +99,7 @@ where
         )
     }
 
-    fn process_srv_response(&self, _resp: &M) -> Response<BoxBody<Bytes, Infallible>> {
+    fn process_srv_response(&self, _resp: M) -> Response<BoxBody<Bytes, Infallible>> {
         panic!("No message should be send to an external service")
     }
 }

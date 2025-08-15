@@ -12,7 +12,7 @@ use prosa::{
         service::ServiceError,
     },
     event::pending::PendingMsgs,
-    io::{listener::ListenerSetting, stream::Stream, url_is_ssl},
+    io::{listener::ListenerSetting, url_is_ssl},
 };
 
 use prosa_utils::config::ssl::SslConfig;
@@ -91,7 +91,7 @@ where
     /// Main loop of the processor
     async fn internal_run(&mut self, name: String) -> Result<(), Box<dyn ProcError + Send + Sync>> {
         // Initiate an adaptor for the stub processor
-        let mut adaptor = A::new(self, &name)?;
+        let adaptor = A::new(self, &name)?;
 
         // Add proc main queue (id: 0)
         self.proc.add_proc().await?;
@@ -101,7 +101,6 @@ where
 
         // Declare a list for pending HTTP request
         let mut pending_req = PendingMsgs::<HyperProcMsg<M>, M>::default();
-        let mut message_ref_request = 0;
 
         // Set default protocol to HTTP2
         if url_is_ssl(&self.settings.listener.url) {
@@ -119,11 +118,11 @@ where
         let observable_http_counter = meter
             .u64_counter("prosa_hyper_srv_count")
             .with_description("Hyper HTTP counter")
-            .init();
+            .build();
         let observable_http_socket = meter
             .i64_up_down_counter("prosa_hyper_srv_socket")
             .with_description("Hyper HTTP socket counter")
-            .init();
+            .build();
 
         let listener = Arc::new(self.settings.listener.bind().await?);
         let service_adaptor = Arc::new(adaptor.clone());
@@ -138,14 +137,15 @@ where
                             msg
                         ),
                         InternalMsg::Response(msg) => {
-                            if let Some(hyper_msg) = pending_req.pull_msg(msg.get_id()) {
-                                let _ = hyper_msg.response_queue.send(InternalMsg::Response(msg));
+                            if let Some(mut hyper_msg) = pending_req.pull_msg(msg.get_id()) {
+                                let response_queue = hyper_msg.get_response_queue()?;
+                                let _ = response_queue.send(InternalMsg::Response(msg));
                             }
                         }
                         InternalMsg::Error(err_msg) => {
-                            if let Some(hyper_err_msg) = pending_req.pull_msg(err_msg.get_id()) {
-                                let _ = hyper_err_msg
-                                    .response_queue
+                            if let Some(mut hyper_err_msg) = pending_req.pull_msg(err_msg.get_id()) {
+                                let response_queue = hyper_err_msg.get_response_queue()?;
+                                let _ = response_queue
                                     .send(InternalMsg::Error(err_msg));
                             }
                         }
@@ -160,17 +160,19 @@ where
                         }
                     }
                 },
-                Some(http_msg) = http_rx.recv() => {
-                    let service_name = http_msg.get_service().clone();
-                    if let Some(service) = self.service.get_proc_service(&service_name, message_ref_request) {
-                        debug!("The service is find: {service:?}, send to the internal service");
-                        service.proc_queue.send(InternalMsg::Request(RequestMsg::new(message_ref_request, service_name, http_msg.get_data().clone(), self.proc.get_service_queue().clone()))).await.unwrap();
-                        pending_req.push_with_id(message_ref_request, http_msg, self.settings.service_timeout);
-
-                        message_ref_request += 1;
+                Some(mut http_msg) = http_rx.recv() => {
+                    if let Some(service) = self.service.get_proc_service(http_msg.get_service())
+                        && let Some(http_msg_data) = http_msg.take_data()
+                    {
+                        let request = RequestMsg::new(http_msg.get_service().clone(), http_msg_data, self.proc.get_service_queue().clone());
+                        let request_id = request.get_id();
+                        service.proc_queue.send(InternalMsg::Request(request)).await.unwrap();
+                        pending_req.push_with_id(request_id, http_msg, self.settings.service_timeout);
                     } else {
-                        let origin_data = http_msg.get_data().clone();
-                        let _ = http_msg.response_queue.send(InternalMsg::Error(ErrorMsg::new(0, service_name.clone(), span!(Level::WARN, "hyper::server::Msg", code = "503"), origin_data, ServiceError::UnableToReachService(service_name))));
+                        let service_name = http_msg.get_service().clone();
+                        let response_queue = http_msg.get_response_queue()?;
+                        let data = http_msg.take_data();
+                        let _ = response_queue.send(InternalMsg::Error(ErrorMsg::new(http_msg, service_name.clone(), span!(Level::WARN, "hyper::server::Msg", code = "503"), data, ServiceError::UnableToReachService(service_name))));
                     }
                 },
                 accept_result = listener.accept_raw() => {
@@ -184,15 +186,7 @@ where
                     tokio::task::spawn(async move {
                         match listener.handshake(stream).await {
                             Ok(stream) => {
-                                let is_http2 = if let Stream::Ssl(ssl) = &stream {
-                                    if let Some(alpn) = ssl.ssl().selected_alpn_protocol() {
-                                        alpn == H2
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                };
+                                let is_http2 = stream.selected_alpn_check(|alpn| alpn == H2);
 
                                 http_socket.add(1, &[KeyValue::new("version", if is_http2 { "HTTP/2" } else { "HTTP/1.1" })]);
 
@@ -226,13 +220,14 @@ where
                         debug!("Connection closed {addr}");
                     });
                 },
-                Some(msg) = pending_req.pull(), if !pending_req.is_empty() => {
+                Some(mut msg) = pending_req.pull(), if !pending_req.is_empty() => {
                     warn!(parent: msg.get_span(), "Timeout message {:?}", msg);
 
                     let service_name = msg.get_service().clone();
                     let span_msg = msg.get_span().clone();
-                    let origin_data = msg.get_data().clone();
-                    let _ = msg.response_queue.send(InternalMsg::Error(ErrorMsg::new(0, service_name.clone(), span_msg, origin_data, ServiceError::Timeout(service_name, self.settings.service_timeout.as_millis() as u64))));
+                    let response_queue = msg.get_response_queue()?;
+                    let data = msg.take_data();
+                    let _ = response_queue.send(InternalMsg::Error(ErrorMsg::new(msg, service_name.clone(), span_msg, data, ServiceError::Timeout(service_name, self.settings.service_timeout.as_millis() as u64))));
                 },
             }
         }
