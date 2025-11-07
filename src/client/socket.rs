@@ -19,14 +19,16 @@ use prosa::{
 };
 use prosa_utils::config::ssl::SslConfig;
 use tokio::{task::JoinSet, time};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::{HyperProcError, client::adaptor::HyperClientAdaptor, hyper_version_str};
 
 /// Hyper client socket
 #[derive(Debug, Clone)]
 pub struct HyperClientSocket {
+    /// Target of the socket
     target: TargetSetting,
+    /// Whether the socket is using HTTP/2
     is_http2: bool,
 }
 
@@ -69,6 +71,7 @@ impl HyperClientSocket {
         join_set.spawn(async move {
             let io = TokioIo::new(self.target.connect().await?);
             let socket_id = io.inner().as_raw_fd();
+            let target_addr = self.target.to_string();
             if io.inner().selected_alpn_check(|alpn| alpn == b"h2") {
                 self.is_http2 = true;
                 match time::timeout(
@@ -78,7 +81,7 @@ impl HyperClientSocket {
                 .await
                 {
                     Ok(Ok((sender, mut connection))) => {
-                        debug!(addr = self.target.to_string(), "Connected to HTTP2 remote");
+                        debug!(addr = target_addr, "Connected to HTTP2 remote");
                         let (tx_queue, mut rx_queue) = tokio::sync::mpsc::channel(2048);
                         proc.add_proc_queue(tx_queue, socket_id as u32).await?;
                         proc.add_service(vec![service_name.clone()], socket_id as u32)
@@ -88,7 +91,7 @@ impl HyperClientSocket {
                             tokio::select! {
                                 // Closed the socket
                                 Err(_) = &mut connection => {
-                                    debug!(addr = self.target.to_string(), "Remote close the socket");
+                                    debug!(addr = target_addr, "Remote close the socket");
                                     proc.remove_proc_queue(socket_id as u32).await?;
                                     return Ok(self);
                                 }
@@ -100,9 +103,10 @@ impl HyperClientSocket {
                                                 let req_instant = Instant::now();
                                                 let mut sender = sender.clone();
                                                 let adaptor = adaptor.clone();
+                                                let target_url = self.target.url.clone();
                                                 let message_histogram = message_histogram.clone();
                                                 tokio::spawn(async move {
-                                                    match adaptor.process_srv_request(data) {
+                                                    match adaptor.process_srv_request(data, &target_url) {
                                                         Ok(http_request) => {
                                                             let http_response = sender.send_request(http_request).await;
 
@@ -178,7 +182,7 @@ impl HyperClientSocket {
                 .await
                 {
                     Ok(Ok((mut sender, mut connection))) => {
-                        debug!(addr = self.target.to_string(), "Connected to HTTP1 remote");
+                        debug!(addr = target_addr, "Connected to HTTP1 remote");
                         let (tx_queue, mut rx_queue) = tokio::sync::mpsc::channel(2048);
                         proc.add_proc_queue(tx_queue, socket_id as u32).await?;
                         proc.add_service(vec![service_name.clone()], socket_id as u32)
@@ -191,7 +195,7 @@ impl HyperClientSocket {
                             tokio::select! {
                                 // Closed the socket
                                 Err(_) = &mut connection => {
-                                    debug!(addr = self.target.to_string(), "Remote close the socket");
+                                    debug!(addr = target_addr, "Remote close the socket");
                                     proc.remove_proc_queue(socket_id as u32).await?;
                                     return Ok(self);
                                 }
@@ -200,7 +204,7 @@ impl HyperClientSocket {
                                     match msg {
                                         InternalMsg::Request(mut msg) => {
                                             if let Some(data) = msg.take_data() {
-                                                match adaptor.process_srv_request(data) {
+                                                match adaptor.process_srv_request(data, &self.target.url) {
                                                     Ok(http_request) => {
                                                         msg_to_send = Some(msg);
                                                         request_to_send = Some(http_request);
