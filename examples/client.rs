@@ -22,6 +22,7 @@ use prosa_utils::config::tracing::TelemetryFilter;
 use prosa_utils::msg::simple_string_tvf::SimpleStringTvf;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
+use url::Url;
 
 /// Demo Hyper processor adaptor
 #[derive(Debug, Adaptor, Clone)]
@@ -55,14 +56,13 @@ where
     fn process_srv_request(
         &self,
         request: M,
+        socket_url: &Url,
     ) -> Result<Request<BoxBody<Bytes, Infallible>>, prosa::core::service::ServiceError> {
-        let uri = request
+        let path = request
             .get_string(1)
             .map_err(|e| ServiceError::ProtocolError(e.to_string()))?;
-        debug!(
-            name = self.prosa_name,
-            "Processing request for URI: {}", uri
-        );
+        let mut uri = socket_url.clone();
+        uri.set_path(path.as_str());
 
         Request::builder()
             .uri(uri.as_str())
