@@ -4,6 +4,7 @@ use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use hyper::{Request, Response};
 use prosa::core::{error::ProcError, service::ServiceError};
+use url::Url;
 
 use crate::client::proc::HyperClientProc;
 
@@ -51,6 +52,7 @@ where
     fn process_srv_request(
         &self,
         request: M,
+        socket_url: &Url,
     ) -> Result<Request<BoxBody<Bytes, Infallible>>, ServiceError>;
 
     /// Method to process input HTTP response to respond with an TVF response.
