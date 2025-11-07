@@ -1,6 +1,6 @@
 [package]
 name = "prosa-hyper"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Jérémy HERGAULT <jeremy.hergault@worldline.com>", "Anthony THOMAS <anthony.thomas@worldline.com>", "Julien TERUEL <julien.teruel@worldline.com>", "Rene-Louis EYMARD <rene-louis.eymard@worldline.com>"]
 description = "ProSA Hyper processor for HTTP client/server"
 homepage = "https://worldline.com/"
@@ -8,13 +8,28 @@ repository = "https://github.com/worldline/ProSA-Hyper"
 edition = "2024"
 license = "LGPL-3.0-or-later"
 
+[features]
+default = ["server", "client"]
+server = []
+client = []
+
 [[example]]
 name = "server"
+required-features = ["server"]
+
+[[example]]
+name = "client"
+required-features = ["client"]
 
 [package.metadata.prosa.hyper_srv]
 proc = "server::proc::HyperServerProc"
 settings = "server::proc::HyperServerSettings"
 adaptor = ["server::adaptor::HelloHyperServerAdaptor"]
+
+[package.metadata.prosa.hyper_cli]
+proc = "client::proc::HyperClientProc"
+settings = "client::proc::HyperClientSettings"
+adaptor = []
 
 [dependencies]
 bytes = "1"

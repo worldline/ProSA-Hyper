@@ -98,7 +98,7 @@ where
 #[settings]
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub(crate) struct MainHyperSettings {
-    pub(crate) hyper: HyperServerSettings,
+    pub(crate) hyper_server: HyperServerSettings,
 }
 
 #[tokio::main]
@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .arg(arg!(-s --stub "Start a Stub processor").action(ArgAction::SetTrue))
         .arg(
             arg!(-c --config <CONFIG_PATH> "Path of the Hyper ProSA server configuration file")
-                .default_value("examples/server.yml"),
+                .default_value("examples/config.yml"),
         )
         .get_matches();
 
@@ -144,9 +144,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let main_task = main.run();
 
     debug!("Start the Hyper processor");
-    let http_proc =
-        HyperServerProc::<SimpleStringTvf>::create(1, bus.clone(), prosa_hyper_settings.hyper);
-    Proc::<HyperDemoAdaptor>::run(http_proc, String::from("hyper"));
+    let http_proc = HyperServerProc::<SimpleStringTvf>::create(
+        1,
+        bus.clone(),
+        prosa_hyper_settings.hyper_server,
+    );
+    Proc::<HyperDemoAdaptor>::run(http_proc, String::from("hyper_server"));
 
     if matches.contains_id("stub") && matches.get_flag("stub") {
         debug!("Start a Stub processor");

@@ -90,7 +90,7 @@ where
 {
     /// Main loop of the processor
     async fn internal_run(&mut self, name: String) -> Result<(), Box<dyn ProcError + Send + Sync>> {
-        // Initiate an adaptor for the stub processor
+        // Initiate an adaptor for the Hyper server processor
         let adaptor = A::new(self, &name)?;
 
         // Add proc main queue (id: 0)
@@ -117,11 +117,11 @@ where
         let meter = self.get_proc_param().meter("hyper_server");
         let observable_http_counter = meter
             .u64_counter("prosa_hyper_srv_count")
-            .with_description("Hyper HTTP counter")
+            .with_description("Hyper HTTP server counter")
             .build();
         let observable_http_socket = meter
             .i64_up_down_counter("prosa_hyper_srv_socket")
-            .with_description("Hyper HTTP socket counter")
+            .with_description("Hyper HTTP server socket counter")
             .build();
 
         let listener = Arc::new(self.settings.listener.bind().await?);
