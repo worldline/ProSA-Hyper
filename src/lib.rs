@@ -15,7 +15,10 @@ use std::{convert::Infallible, io};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use hyper::{Response, Version};
-use prosa::core::error::ProcError;
+use prosa::core::{
+    error::{BusError, ProcError},
+    msg::InternalMsg,
+};
 use thiserror::Error;
 
 const H2: &[u8] = b"h2";
@@ -29,6 +32,9 @@ pub enum HyperProcError {
     /// Hyper Error
     #[error("Hyper error: {0}")]
     Hyper(#[from] hyper::Error),
+    /// Internal bus error
+    #[error("Internal bus error: {0}")]
+    InternalBus(#[from] BusError),
     /// Other Error
     #[error("Other error: {0}")]
     Other(String),
@@ -39,8 +45,28 @@ impl ProcError for HyperProcError {
         match self {
             HyperProcError::Io(error) => error.recoverable(),
             HyperProcError::Hyper(_) => true,
+            HyperProcError::InternalBus(b) => b.recoverable(),
             HyperProcError::Other(_) => true,
         }
+    }
+}
+
+impl<M> From<tokio::sync::mpsc::error::SendError<InternalMsg<M>>> for HyperProcError
+where
+    M: 'static
+        + std::marker::Send
+        + std::marker::Sync
+        + std::marker::Sized
+        + std::clone::Clone
+        + std::fmt::Debug
+        + prosa_utils::msg::tvf::Tvf
+        + std::default::Default,
+{
+    fn from(err: tokio::sync::mpsc::error::SendError<InternalMsg<M>>) -> Self {
+        HyperProcError::InternalBus(BusError::InternalQueue(format!(
+            "Failed to send message: {}",
+            err
+        )))
     }
 }
 
@@ -65,4 +91,8 @@ pub enum HyperResp<M> {
     HttpErr(hyper::Error),
 }
 
+#[cfg(feature = "server")]
 pub mod server;
+
+#[cfg(feature = "client")]
+pub mod client;
