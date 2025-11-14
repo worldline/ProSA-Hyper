@@ -59,5 +59,5 @@ where
     fn process_http_response(
         &self,
         resp: Result<Response<hyper::body::Incoming>, hyper::Error>,
-    ) -> Result<M, ServiceError>;
+    ) -> impl std::future::Future<Output = Result<M, ServiceError>> + Send;
 }
