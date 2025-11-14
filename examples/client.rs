@@ -74,7 +74,7 @@ where
             .map_err(|e| ServiceError::ProtocolError(format!("Failed to build request: {}", e)))
     }
 
-    fn process_http_response(
+    async fn process_http_response(
         &self,
         resp: Result<Response<hyper::body::Incoming>, hyper::Error>,
     ) -> Result<M, prosa::core::service::ServiceError> {

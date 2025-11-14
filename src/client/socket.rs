@@ -1,24 +1,33 @@
 use std::{
+    convert::Infallible,
     io,
     os::fd::AsRawFd,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use hyper::client::conn::{http1, http2};
+use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
+use hyper::{
+    Request,
+    client::conn::{http1, http2},
+};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use opentelemetry::{KeyValue, metrics::Histogram};
 use prosa::{
     core::{
         adaptor::Adaptor,
-        msg::{InternalMsg, Msg as _},
+        msg::{InternalMsg, Msg as _, RequestMsg},
         proc::{ProcBusParam as _, ProcParam},
         service::ServiceError,
     },
     io::{stream::TargetSetting, url_is_ssl},
 };
 use prosa_utils::config::ssl::SslConfig;
-use tokio::{task::JoinSet, time};
+use tokio::{
+    task::JoinSet,
+    time::{self, timeout},
+};
 use tracing::{debug, warn};
 
 use crate::{HyperProcError, client::adaptor::HyperClientAdaptor, hyper_version_str};
@@ -30,10 +39,29 @@ pub struct HyperClientSocket {
     target: TargetSetting,
     /// Whether the socket is using HTTP/2
     is_http2: bool,
+    /// HTTP message timeout duration
+    http_timeout: Duration,
+}
+
+macro_rules! close_socket {
+    ($self:ident, $proc:ident, $socket_id:ident, $msg_queue:ident, $service_name:ident, $return:expr) => {
+        $proc.remove_proc_queue($socket_id as u32).await?;
+        while let Ok(msg) = $msg_queue.try_recv() {
+            if let InternalMsg::Request(req_msg) = msg {
+                req_msg
+                    .return_error_to_sender(
+                        None,
+                        ServiceError::UnableToReachService($service_name.clone()),
+                    )
+                    .await?;
+            }
+        }
+        return $return;
+    };
 }
 
 impl HyperClientSocket {
-    pub fn new(mut target: TargetSetting) -> Self {
+    pub fn new(mut target: TargetSetting, http_timeout: u64) -> Self {
         // Set default protocol to HTTP2 if target enabled SSL
         if let Some(ssl) = target.ssl.as_mut() {
             ssl.set_alpn(vec!["h2".into(), "http/1.1".into()]);
@@ -46,6 +74,7 @@ impl HyperClientSocket {
         HyperClientSocket {
             target,
             is_http2: false,
+            http_timeout: Duration::from_millis(http_timeout),
         }
     }
 
@@ -91,9 +120,8 @@ impl HyperClientSocket {
                             tokio::select! {
                                 // Closed the socket
                                 Err(_) = &mut connection => {
-                                    debug!(addr = target_addr, "Remote close the socket");
-                                    proc.remove_proc_queue(socket_id as u32).await?;
-                                    return Ok(self);
+                                    debug!(addr = target_addr, "Remote HTTP2 close the socket");
+                                    close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
                                 }
                                 // Receive a message to send from the queue
                                 Some(msg) = rx_queue.recv() => {
@@ -104,29 +132,36 @@ impl HyperClientSocket {
                                                 let mut sender = sender.clone();
                                                 let adaptor = adaptor.clone();
                                                 let target_url = self.target.url.clone();
+                                                let service_name = service_name.clone();
                                                 let message_histogram = message_histogram.clone();
                                                 tokio::spawn(async move {
                                                     match adaptor.process_srv_request(data, &target_url) {
                                                         Ok(http_request) => {
-                                                            let http_response = sender.send_request(http_request).await;
+                                                            let _ = match timeout(self.http_timeout, sender.send_request(http_request)).await {
+                                                                Ok(http_response) => {
+                                                                    let (code, version) = http_response.as_ref().map_or((500, "HTTP/2"), |r| (r.status().as_u16() as i64, hyper_version_str(r.version())));
+                                                                    message_histogram.record(
+                                                                        req_instant.elapsed().as_millis() as u64,
+                                                                        &[
+                                                                            KeyValue::new("target", target_url.to_string()),
+                                                                            KeyValue::new("code", code),
+                                                                            KeyValue::new("version", version),
+                                                                        ],
+                                                                    );
 
-                                                            let (code, version) = http_response.as_ref().map_or((500, "HTTP/2"), |r| (r.status().as_u16() as i64, hyper_version_str(r.version())));
-                                                            message_histogram.record(
-                                                                req_instant.elapsed().as_millis() as u64,
-                                                                &[
-                                                                    KeyValue::new("code", code),
-                                                                    KeyValue::new("version", version),
-                                                                ],
-                                                            );
-
-                                                            match adaptor.process_http_response(http_response) {
-                                                                Ok(response) => {
-                                                                    msg.return_to_sender(response).await
+                                                                    match adaptor.process_http_response(http_response).await {
+                                                                        Ok(response) => {
+                                                                            msg.return_to_sender(response).await
+                                                                        },
+                                                                        Err(e) => msg.return_error_to_sender(None, e).await,
+                                                                    }
                                                                 },
-                                                                Err(e) => msg.return_error_to_sender(None, e).await,
-                                                            }
+                                                                Err(_) => msg.return_error_to_sender(None, ServiceError::Timeout(service_name.clone(), self.http_timeout.as_millis() as u64)).await,
+                                                            };
                                                         },
-                                                        Err(e) => msg.return_error_to_sender(None, e).await,
+                                                        Err(e) => {
+                                                            let _ = msg.return_error_to_sender(None, e).await;
+                                                        },
                                                     }
                                                 });
                                             } else {
@@ -148,8 +183,7 @@ impl HyperClientSocket {
                                         InternalMsg::Service(_table) => {/* Will not use service table */},
                                         InternalMsg::Shutdown => {
                                             // Remove the socket queue and wait message to finish
-                                            proc.remove_proc_queue(socket_id as u32).await?;
-                                            return Ok(self);
+                                            close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
                                         }
                                     }
                                 }
@@ -157,11 +191,12 @@ impl HyperClientSocket {
                         }
                     }
                     Ok(Err(e)) => {
-                        warn!("HTTP2 handshake error: {}", e);
-                        Err(HyperProcError::Hyper(e))
+                        warn!(addr = target_addr, "HTTP2 handshake error: {}", e);
+                        Err(HyperProcError::Hyper(e, target_addr))
                     }
                     Err(_) => {
                         warn!(
+                            addr = target_addr,
                             "HTTP2 handshake timeout after {} ms",
                             self.target.connect_timeout
                         );
@@ -187,75 +222,92 @@ impl HyperClientSocket {
                         proc.add_proc_queue(tx_queue, socket_id as u32).await?;
                         proc.add_service(vec![service_name.clone()], socket_id as u32)
                             .await?;
-                        let mut msg_to_send = None;
-                        let mut request_to_send = None;
+                        #[allow(clippy::type_complexity)]
+                        let mut msg_to_send: Option<(RequestMsg<M>, Request<BoxBody<Bytes, Infallible>>)> = None;
                         let mut req_instant = Instant::now();
 
                         loop {
-                            tokio::select! {
-                                // Closed the socket
-                                Err(_) = &mut connection => {
-                                    debug!(addr = target_addr, "Remote close the socket");
-                                    proc.remove_proc_queue(socket_id as u32).await?;
-                                    return Ok(self);
-                                }
-                                // Receive a message to send from the queue
-                                Some(msg) = rx_queue.recv(), if request_to_send.is_none() => {
-                                    match msg {
-                                        InternalMsg::Request(mut msg) => {
-                                            if let Some(data) = msg.take_data() {
-                                                match adaptor.process_srv_request(data, &self.target.url) {
-                                                    Ok(http_request) => {
-                                                        msg_to_send = Some(msg);
-                                                        request_to_send = Some(http_request);
-                                                        req_instant = Instant::now();
+                            if let Some((msg, http_request)) = msg_to_send.take() {
+                                tokio::select! {
+                                    // Closed the socket
+                                    Err(_) = &mut connection => {
+                                        debug!(addr = target_addr, "Remote HTTP1 close the socket");
+                                        close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
+                                    }
+                                    // Send an HTTP request
+                                    response_sent = timeout(self.http_timeout, sender.send_request(http_request)) => {
+                                        match response_sent {
+                                            Ok(response) => {
+                                                let (code, version) = response.as_ref().map_or((500, "HTTP/1"), |r| (r.status().as_u16() as i64, hyper_version_str(r.version())));
+                                                message_histogram.record(
+                                                    req_instant.elapsed().as_millis() as u64,
+                                                    &[
+                                                        KeyValue::new("target", target_addr.clone()),
+                                                        KeyValue::new("code", code),
+                                                        KeyValue::new("version", version),
+                                                    ],
+                                                );
+
+                                                match adaptor.process_http_response(response).await {
+                                                    Ok(r) => {
+                                                        msg.return_to_sender(r).await?;
                                                     },
                                                     Err(e) => {
                                                         msg.return_error_to_sender(None, e).await?;
-                                                    },
+                                                    }
                                                 }
-                                            } else {
-                                                msg.return_error_to_sender(None, ServiceError::UnableToReachService(service_name.clone())).await?;
-                                            }
-                                        },
-                                        InternalMsg::Response(msg) => panic!(
-                                            "The hyper client socket {}/{socket_id} receive a response {:?}",
-                                            proc.get_proc_id(),
-                                            msg
-                                        ),
-                                        InternalMsg::Error(err_msg) => panic!(
-                                            "The hyper client socket {}/{socket_id} receive an error {:?}",
-                                            proc.get_proc_id(),
-                                            err_msg
-                                        ),
-                                        InternalMsg::Command(_) => todo!(),
-                                        InternalMsg::Config => todo!(),
-                                        InternalMsg::Service(_table) => {/* Will not use service table */},
-                                        InternalMsg::Shutdown => {
-                                            // Remove the socket queue and wait message to finish
-                                            proc.remove_proc_queue(socket_id as u32).await?;
-                                            return Ok(self);
-                                        }
+                                            },
+                                            Err(_) => {
+                                                debug!(addr = target_addr, "Message timeout after {} ms", self.http_timeout.as_millis());
+                                                msg.return_error_to_sender(None, ServiceError::Timeout(service_name.clone(), self.http_timeout.as_millis() as u64)).await?;
+                                                // Need to drop the connection because it's HTTP1
+                                                close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
+                                            },
+                                        };
                                     }
                                 }
-                                // Send an HTTP request
-                                response = sender.send_request(request_to_send.take().unwrap()), if request_to_send.is_some() => {
-                                    let (code, version) = response.as_ref().map_or((500, "HTTP/1"), |r| (r.status().as_u16() as i64, hyper_version_str(r.version())));
-                                    message_histogram.record(
-                                        req_instant.elapsed().as_millis() as u64,
-                                        &[
-                                            KeyValue::new("code", code),
-                                            KeyValue::new("version", version),
-                                        ],
-                                    );
-
-                                    let msg = msg_to_send.take().unwrap();
-                                    match adaptor.process_http_response(response) {
-                                        Ok(r) => {
-                                            msg.return_to_sender(r).await?;
-                                        },
-                                        Err(e) => {
-                                            msg.return_error_to_sender(None, e).await?;
+                            } else {
+                                tokio::select! {
+                                    // Closed the socket
+                                    Err(_) = &mut connection => {
+                                        debug!(addr = target_addr, "Remote close the socket");
+                                        close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
+                                    }
+                                    // Receive a message to send from the queue
+                                    Some(msg) = rx_queue.recv() => {
+                                        match msg {
+                                            InternalMsg::Request(mut msg) => {
+                                                if let Some(data) = msg.take_data() {
+                                                    match adaptor.process_srv_request(data, &self.target.url) {
+                                                        Ok(http_request) => {
+                                                            msg_to_send = Some((msg, http_request));
+                                                            req_instant = Instant::now();
+                                                        },
+                                                        Err(e) => {
+                                                            msg.return_error_to_sender(None, e).await?;
+                                                        },
+                                                    }
+                                                } else {
+                                                    msg.return_error_to_sender(None, ServiceError::UnableToReachService(service_name.clone())).await?;
+                                                }
+                                            },
+                                            InternalMsg::Response(msg) => panic!(
+                                                "The hyper client socket {}/{socket_id} receive a response {:?}",
+                                                proc.get_proc_id(),
+                                                msg
+                                            ),
+                                            InternalMsg::Error(err_msg) => panic!(
+                                                "The hyper client socket {}/{socket_id} receive an error {:?}",
+                                                proc.get_proc_id(),
+                                                err_msg
+                                            ),
+                                            InternalMsg::Command(_) => todo!(),
+                                            InternalMsg::Config => todo!(),
+                                            InternalMsg::Service(_table) => {/* Will not use service table */},
+                                            InternalMsg::Shutdown => {
+                                                // Remove the socket queue and wait message to finish
+                                                close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
+                                            }
                                         }
                                     }
                                 }
@@ -263,11 +315,12 @@ impl HyperClientSocket {
                         }
                     }
                     Ok(Err(e)) => {
-                        warn!("HTTP1 handshake error: {}", e);
-                        Err(HyperProcError::Hyper(e))
+                        warn!(addr = target_addr, "HTTP1 handshake error: {}", e);
+                        Err(HyperProcError::Hyper(e, target_addr))
                     }
                     Err(_) => {
                         warn!(
+                            addr = target_addr,
                             "HTTP1 handshake timeout after {} ms",
                             self.target.connect_timeout
                         );

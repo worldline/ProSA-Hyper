@@ -33,6 +33,9 @@ pub struct HyperClientSettings {
     /// Maximum number of socket connections per target
     #[serde(default = "HyperClientSettings::default_max_socket")]
     max_socket: u32,
+    /// Timeout for HTTP messages in milliseconds
+    #[serde(default = "HyperClientSettings::default_http_timeout")]
+    http_timeout: u64,
 }
 
 impl HyperClientSettings {
@@ -42,6 +45,10 @@ impl HyperClientSettings {
 
     fn default_max_socket() -> u32 {
         20
+    }
+
+    fn default_http_timeout() -> u64 {
+        5000
     }
 
     /// Add a new Hyper client backend
@@ -58,6 +65,7 @@ impl Default for HyperClientSettings {
             backends: Vec::new(),
             min_socket: Self::default_min_socket(),
             max_socket: Self::default_max_socket(),
+            http_timeout: Self::default_http_timeout(),
         }
     }
 }
@@ -105,7 +113,8 @@ where
         if !self.settings.backends.is_empty() {
             for backend in &self.settings.backends {
                 for _ in 0..self.settings.min_socket {
-                    let client_socket = HyperClientSocket::new(backend.clone());
+                    let client_socket =
+                        HyperClientSocket::new(backend.clone(), self.settings.http_timeout);
                     client_socket.spawn(
                         &mut client_sockets,
                         self.proc.clone(),

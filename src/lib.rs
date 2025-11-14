@@ -30,8 +30,8 @@ pub enum HyperProcError {
     #[error("Hyper IO error: {0}")]
     Io(#[from] io::Error),
     /// Hyper Error
-    #[error("Hyper error: {0}")]
-    Hyper(#[from] hyper::Error),
+    #[error("Hyper error[{1}]: `{0}`")]
+    Hyper(hyper::Error, String),
     /// Internal bus error
     #[error("Internal bus error: {0}")]
     InternalBus(#[from] BusError),
@@ -44,7 +44,7 @@ impl ProcError for HyperProcError {
     fn recoverable(&self) -> bool {
         match self {
             HyperProcError::Io(error) => error.recoverable(),
-            HyperProcError::Hyper(_) => true,
+            HyperProcError::Hyper(..) => true,
             HyperProcError::InternalBus(b) => b.recoverable(),
             HyperProcError::Other(_) => true,
         }
