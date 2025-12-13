@@ -7,23 +7,22 @@ use prosa::{
     core::{
         adaptor::Adaptor,
         error::ProcError,
-        msg::{ErrorMsg, InternalMsg, Msg, RequestMsg},
+        msg::{InternalMsg, Msg, RequestMsg},
         proc::{Proc, ProcBusParam, ProcConfig as _, proc, proc_settings},
         service::ServiceError,
     },
     event::pending::PendingMsgs,
-    io::{listener::ListenerSetting, url_is_ssl},
+    io::{SslConfig, listener::ListenerSetting, url_is_ssl},
 };
 
-use prosa_utils::config::ssl::SslConfig;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{Level, debug, info, span, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::{H2, server::service::HyperService};
 
-use super::{HyperProcMsg, adaptor::HyperServerAdaptor};
+use super::adaptor::HyperServerAdaptor;
 
 /// Hyper server processor settings
 #[proc_settings]
@@ -84,23 +83,23 @@ where
         + std::marker::Sized
         + std::clone::Clone
         + std::fmt::Debug
-        + prosa_utils::msg::tvf::Tvf
+        + prosa::core::msg::Tvf
         + std::default::Default,
     A: 'static + Adaptor + HyperServerAdaptor<M> + Clone + std::marker::Send + std::marker::Sync,
 {
     /// Main loop of the processor
-    async fn internal_run(&mut self, name: String) -> Result<(), Box<dyn ProcError + Send + Sync>> {
-        // Initiate an adaptor for the stub processor
-        let adaptor = A::new(self, &name)?;
+    async fn internal_run(&mut self) -> Result<(), Box<dyn ProcError + Send + Sync>> {
+        // Initiate an adaptor for the hyper server processor
+        let adaptor = A::new(self)?;
 
         // Add proc main queue (id: 0)
         self.proc.add_proc().await?;
 
         // Declare an internal queue for HTTP requests
-        let (http_tx, mut http_rx) = mpsc::channel::<HyperProcMsg<M>>(2048);
+        let (http_tx, mut http_rx) = mpsc::channel::<RequestMsg<M>>(2048);
 
         // Declare a list for pending HTTP request
-        let mut pending_req = PendingMsgs::<HyperProcMsg<M>, M>::default();
+        let mut pending_req = PendingMsgs::<RequestMsg<M>, M>::default();
 
         // Set default protocol to HTTP2
         if url_is_ssl(&self.settings.listener.url) {
@@ -136,17 +135,16 @@ where
                             self.get_proc_id(),
                             msg
                         ),
-                        InternalMsg::Response(msg) => {
-                            if let Some(mut hyper_msg) = pending_req.pull_msg(msg.get_id()) {
-                                let response_queue = hyper_msg.get_response_queue()?;
-                                let _ = response_queue.send(InternalMsg::Response(msg));
+                        InternalMsg::Response(mut msg) => {
+                            if let Some(hyper_msg) = pending_req.pull_msg(msg.get_id())
+                                && let Some(data) = msg.take_data()
+                            {
+                                let _ = hyper_msg.return_to_sender(data);
                             }
                         }
-                        InternalMsg::Error(err_msg) => {
-                            if let Some(mut hyper_err_msg) = pending_req.pull_msg(err_msg.get_id()) {
-                                let response_queue = hyper_err_msg.get_response_queue()?;
-                                let _ = response_queue
-                                    .send(InternalMsg::Error(err_msg));
+                        InternalMsg::Error(mut err_msg) => {
+                            if let Some(hyper_err_msg) = pending_req.pull_msg(err_msg.get_id()) {
+                                let _ = hyper_err_msg.return_error_to_sender(err_msg.take_data(), err_msg.into_err());
                             }
                         }
                         InternalMsg::Command(_) => todo!(),
@@ -169,10 +167,14 @@ where
                         service.proc_queue.send(InternalMsg::Request(request)).await.unwrap();
                         pending_req.push_with_id(request_id, http_msg, self.settings.service_timeout);
                     } else {
-                        let service_name = http_msg.get_service().clone();
-                        let response_queue = http_msg.get_response_queue()?;
+                        warn!(
+                            parent: http_msg.get_span(),
+                            code = "503",
+                            "hyper::server::Msg",
+                        );
                         let data = http_msg.take_data();
-                        let _ = response_queue.send(InternalMsg::Error(ErrorMsg::new(http_msg, service_name.clone(), span!(Level::WARN, "hyper::server::Msg", code = "503"), data, ServiceError::UnableToReachService(service_name))));
+                        let service_name = http_msg.get_service().clone();
+                        let _ = http_msg.return_error_to_sender(data, ServiceError::UnableToReachService(service_name));
                     }
                 },
                 accept_result = listener.accept_raw() => {
@@ -222,12 +224,15 @@ where
                 },
                 Some(mut msg) = pending_req.pull(), if !pending_req.is_empty() => {
                     warn!(parent: msg.get_span(), "Timeout message {:?}", msg);
-
-                    let service_name = msg.get_service().clone();
-                    let span_msg = msg.get_span().clone();
-                    let response_queue = msg.get_response_queue()?;
                     let data = msg.take_data();
-                    let _ = response_queue.send(InternalMsg::Error(ErrorMsg::new(msg, service_name.clone(), span_msg, data, ServiceError::Timeout(service_name, self.settings.service_timeout.as_millis() as u64))));
+                    let service_name = msg.get_service().clone();
+                    let _ = msg.return_error_to_sender(
+                        data,
+                        ServiceError::Timeout(
+                            service_name,
+                            self.settings.service_timeout.as_millis() as u64,
+                        ),
+                    );
                 },
             }
         }

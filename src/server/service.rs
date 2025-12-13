@@ -12,12 +12,11 @@ use hyper::service::Service;
 use hyper::{Request, Response};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
-use prosa::core::msg::{InternalMsg, Msg};
+use prosa::core::msg::{InternalMsg, Msg, RequestMsg};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::hyper_version_str;
 
-use super::HyperProcMsg;
 use super::adaptor::HyperServerAdaptor;
 
 #[derive(Debug, Clone)]
@@ -31,11 +30,11 @@ where
         + std::marker::Sized
         + std::clone::Clone
         + std::fmt::Debug
-        + prosa_utils::msg::tvf::Tvf
+        + prosa::core::msg::Tvf
         + std::default::Default,
 {
     adaptor: Arc<A>,
-    proc_queue: mpsc::Sender<HyperProcMsg<M>>,
+    proc_queue: mpsc::Sender<RequestMsg<M>>,
     metric_counter: Counter<u64>,
 }
 
@@ -48,13 +47,13 @@ where
         + std::marker::Sized
         + std::clone::Clone
         + std::fmt::Debug
-        + prosa_utils::msg::tvf::Tvf
+        + prosa::core::msg::Tvf
         + std::default::Default,
 {
     /// Method to create an Hyper service
     pub(crate) fn new(
         adaptor: Arc<A>,
-        proc_queue: mpsc::Sender<HyperProcMsg<M>>,
+        proc_queue: mpsc::Sender<RequestMsg<M>>,
         metric_counter: Counter<u64>,
     ) -> HyperService<A, M> {
         HyperService {
@@ -66,7 +65,7 @@ where
 
     async fn process_call(
         adaptor: Arc<A>,
-        proc_queue: mpsc::Sender<HyperProcMsg<M>>,
+        proc_queue: mpsc::Sender<RequestMsg<M>>,
         req: Request<hyper::body::Incoming>,
         metric_counter: Counter<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, hyper::Error> {
@@ -106,13 +105,13 @@ where
     /// Method to wait for response send by the ProSA HTTP processor
     async fn wait_intern_resp(
         adaptor: Arc<A>,
-        proc_queue: mpsc::Sender<HyperProcMsg<M>>,
+        proc_queue: mpsc::Sender<RequestMsg<M>>,
         service_name: String,
         request: M,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, hyper::Error> {
         let (resp_tx, resp_rx) = oneshot::channel::<InternalMsg<M>>();
         let _ = proc_queue
-            .send(HyperProcMsg::new(service_name, request, resp_tx))
+            .send(RequestMsg::new(service_name, request, resp_tx))
             .await;
 
         match resp_rx.await {
@@ -177,7 +176,7 @@ where
         + std::marker::Sized
         + std::clone::Clone
         + std::fmt::Debug
-        + prosa_utils::msg::tvf::Tvf
+        + prosa::core::msg::Tvf
         + std::default::Default
         + std::marker::Sync,
 {
