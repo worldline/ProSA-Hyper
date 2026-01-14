@@ -1,5 +1,11 @@
 # ProSA Hyper
 
+[<img alt="github" src="https://img.shields.io/badge/github-46beaa?style=for-the-badge&labelColor=555555&logo=github" height="20">](https://github.com/worldline/ProSA-Hyper)
+[<img alt="crates-io" src="https://img.shields.io/badge/crates.io-ffeb78?style=for-the-badge&labelColor=555555&logo=rust" height="20">](https://crates.io/crates/prosa-hyper)
+[<img alt="docs-rs" src="https://img.shields.io/badge/docs.rs-41b4d2?style=for-the-badge&labelColor=555555&logo=docs.rs" height="20">](https://docs.rs/prosa-hyper)
+[<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/worldline/ProSA-Hyper/ci.yml?branch%3Amain&style=for-the-badge" height="20">](https://github.com/worldline/ProSA-Hyper/actions?query=branch%3Amain)
+[<img alt="dependency status" src="https://img.shields.io/deps-rs/repo/github/worldline/ProSA-Hyper?style=for-the-badge" height="20">](https://deps.rs/repo/github/worldline/ProSA-Hyper)
+
 [ProSA](https://github.com/worldline/ProSA) Hyper processor for HTTP client/server build on [Hyper](https://hyper.rs/), a Tokio implementation of HTTP.
 
 ## Use
@@ -29,6 +35,8 @@ http_server:
       key: key.pem
       passphrase: MySuperPassphrase
 ```
+
+If you have some slow services, you can set the `service_timeout` parameter (800 ms by default).
 
 ## Examples
 

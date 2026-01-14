@@ -1,139 +1,11 @@
 //! Module to handle HTTP server
 
-use std::time::{Duration, SystemTime};
-
-use prosa::core::{
-    error::BusError,
-    msg::{InternalMsg, Msg},
-};
-
-use tokio::sync::oneshot;
-
-use tracing::{Level, Span, span};
-
 /// Adaptor for Hyper server processor
 pub mod adaptor;
 /// ProSA Hyper server processor
 pub mod proc;
 /// Hyper service definition
 pub(crate) mod service;
-
-/// Hyper processor
-#[derive(Debug)]
-pub struct HyperProcMsg<M>
-where
-    M: 'static
-        + std::marker::Send
-        + std::marker::Sync
-        + std::marker::Sized
-        + std::clone::Clone
-        + std::fmt::Debug
-        + prosa_utils::msg::tvf::Tvf
-        + std::default::Default,
-{
-    id: u64,
-    span: Span,
-    service: String,
-    data: Option<M>,
-    begin_time: SystemTime,
-    response_queue: Option<oneshot::Sender<InternalMsg<M>>>,
-}
-
-impl<M> HyperProcMsg<M>
-where
-    M: 'static
-        + std::marker::Send
-        + std::marker::Sync
-        + std::marker::Sized
-        + std::clone::Clone
-        + std::fmt::Debug
-        + prosa_utils::msg::tvf::Tvf
-        + std::default::Default,
-{
-    /// Create a new Hyper processor message
-    pub fn new(
-        service: String,
-        data: M,
-        response_queue: oneshot::Sender<InternalMsg<M>>,
-    ) -> HyperProcMsg<M> {
-        let span = span!(Level::INFO, "HyperProcMsg", service = service);
-        HyperProcMsg {
-            id: 0,
-            service,
-            span,
-            data: Some(data),
-            begin_time: SystemTime::now(),
-            response_queue: Some(response_queue),
-        }
-    }
-
-    /// Set the ID of the Hyper processor
-    pub fn set_id(&mut self, id: u64) {
-        self.id = id;
-    }
-
-    /// Get the response queue to respond to the message
-    pub fn get_response_queue(&mut self) -> Result<oneshot::Sender<InternalMsg<M>>, BusError> {
-        self.response_queue
-            .take()
-            .ok_or(BusError::InternalQueue("HyperProcMsg".to_string()))
-    }
-}
-
-impl<M> Msg<M> for HyperProcMsg<M>
-where
-    M: 'static
-        + std::marker::Send
-        + std::marker::Sync
-        + std::marker::Sized
-        + std::clone::Clone
-        + std::fmt::Debug
-        + prosa_utils::msg::tvf::Tvf
-        + std::default::Default,
-{
-    fn get_id(&self) -> u64 {
-        self.id
-    }
-
-    fn get_service(&self) -> &String {
-        &self.service
-    }
-
-    fn get_span(&self) -> &Span {
-        &self.span
-    }
-
-    fn get_span_mut(&mut self) -> &mut Span {
-        &mut self.span
-    }
-
-    fn enter_span(&self) -> span::Entered<'_> {
-        self.span.enter()
-    }
-
-    fn get_data(&self) -> Result<&M, BusError> {
-        self.data.as_ref().ok_or(BusError::NoData)
-    }
-
-    fn get_data_mut(&mut self) -> Result<&mut M, BusError> {
-        self.data.as_mut().ok_or(BusError::NoData)
-    }
-
-    fn elapsed(&self) -> Duration {
-        self.begin_time.elapsed().unwrap_or(Duration::new(0, 0))
-    }
-
-    fn take_data(&mut self) -> Option<M> {
-        self.data.take()
-    }
-
-    fn take_data_if<P>(&mut self, predicate: P) -> Option<M>
-    where
-        P: FnOnce(&mut M) -> bool,
-    {
-        self.data.take_if(predicate)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -226,7 +98,6 @@ mod tests {
     {
         fn new(
             _proc: &crate::server::proc::HyperServerProc<M>,
-            _prosa_name: &str,
         ) -> Result<Self, Box<dyn ProcError + Send + Sync>>
         where
             Self: Sized,
@@ -266,15 +137,19 @@ mod tests {
         let url = settings.server.listener.url.clone();
 
         // Create bus and main processor
-        let (bus, main) = MainProc::<SimpleStringTvf>::create(&settings);
+        let (bus, main) = MainProc::<SimpleStringTvf>::create(&settings, Some(1));
 
         // Launch the main task
         let main_task = main.run();
 
         // Launch an HTTP server processor
-        let http_server_proc =
-            HyperServerProc::<SimpleStringTvf>::create(1, bus.clone(), settings.server);
-        Proc::<ServerTestAdaptor>::run(http_server_proc, String::from("HTTP_SERVER_PROC"));
+        let http_server_proc = HyperServerProc::<SimpleStringTvf>::create(
+            1,
+            String::from("HTTP_SERVER_PROC"),
+            bus.clone(),
+            settings.server,
+        );
+        Proc::<ServerTestAdaptor>::run(http_server_proc);
 
         // Wait for processor to start
         std::thread::sleep(Duration::from_secs(1));

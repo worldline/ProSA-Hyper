@@ -11,7 +11,7 @@ use hyper::{Request, Response};
 use prosa::core::adaptor::Adaptor;
 use prosa::core::error::ProcError;
 use prosa::core::main::MainRunnable as _;
-use prosa::core::proc::{Proc, ProcConfig};
+use prosa::core::proc::{Proc, ProcBusParam as _, ProcConfig};
 use prosa::core::settings::settings;
 use prosa::stub::adaptor::StubParotAdaptor;
 use prosa::stub::proc::StubSettings;
@@ -41,12 +41,9 @@ where
         + prosa_utils::msg::tvf::Tvf
         + std::default::Default,
 {
-    fn new(
-        _proc: &HyperServerProc<M>,
-        prosa_name: &str,
-    ) -> Result<Self, Box<dyn ProcError + Send + Sync>> {
+    fn new(proc: &HyperServerProc<M>) -> Result<Self, Box<dyn ProcError + Send + Sync>> {
         Ok(HyperDemoAdaptor {
-            prosa_name: prosa_name.into(),
+            prosa_name: proc.name().to_string(),
         })
     }
 
@@ -57,6 +54,10 @@ where
         match req.uri().path() {
             "/" => HyperResp::HttpResp(
                 Response::builder()
+                    .header(
+                        "Server",
+                        <HyperDemoAdaptor as HyperServerAdaptor<M>>::SERVER_HEADER,
+                    )
                     .body(BoxBody::new(Full::new(Bytes::from(format!(
                         "{} - Home of {}",
                         if req.version() == hyper::Version::HTTP_2 {
@@ -77,6 +78,10 @@ where
             _ => HyperResp::HttpResp(
                 Response::builder()
                     .status(404)
+                    .header(
+                        "Server",
+                        <HyperDemoAdaptor as HyperServerAdaptor<M>>::SERVER_HEADER,
+                    )
                     .body(BoxBody::new(Full::new(Bytes::from("Not Found"))))
                     .unwrap(),
             ),
@@ -137,22 +142,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     prosa_hyper_settings.observability.tracing_init(&filter)?;
 
     // Create bus and main processor
-    let (bus, main) = MainProc::<SimpleStringTvf>::create(&prosa_hyper_settings);
+    let (bus, main) = MainProc::<SimpleStringTvf>::create(&prosa_hyper_settings, Some(2));
 
     // Launch the main task
     debug!("Launch the main task");
     let main_task = main.run();
 
     debug!("Start the Hyper processor");
-    let http_proc =
-        HyperServerProc::<SimpleStringTvf>::create(1, bus.clone(), prosa_hyper_settings.hyper);
-    Proc::<HyperDemoAdaptor>::run(http_proc, String::from("hyper"));
+    let http_proc = HyperServerProc::<SimpleStringTvf>::create(
+        1,
+        String::from("hyper"),
+        bus.clone(),
+        prosa_hyper_settings.hyper,
+    );
+    Proc::<HyperDemoAdaptor>::run(http_proc);
 
     if matches.contains_id("stub") && matches.get_flag("stub") {
         debug!("Start a Stub processor");
         let stub_settings = StubSettings::new(vec![String::from("SRV_TEST")]);
-        let stub_proc = StubProc::<SimpleStringTvf>::create(2, bus.clone(), stub_settings);
-        Proc::<StubParotAdaptor>::run(stub_proc, String::from("STUB_PROC"));
+        let stub_proc = StubProc::<SimpleStringTvf>::create(
+            2,
+            String::from("STUB_PROC"),
+            bus.clone(),
+            stub_settings,
+        );
+        Proc::<StubParotAdaptor>::run(stub_proc);
     }
 
     // Wait on main task

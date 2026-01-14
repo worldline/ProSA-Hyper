@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use bytes::Bytes;
 use http_body_util::{Full, combinators::BoxBody};
 use hyper::{Request, Response};
-use prosa::core::{adaptor::Adaptor, error::ProcError};
+use prosa::core::{adaptor::Adaptor, error::ProcError, proc::ProcBusParam as _};
 
 use crate::HyperResp;
 
@@ -29,7 +29,7 @@ where
         + std::marker::Sized
         + std::clone::Clone
         + std::fmt::Debug
-        + prosa_utils::msg::tvf::Tvf
+        + prosa::core::msg::Tvf
         + std::default::Default,
 {
     /// Server header value send by the server
@@ -43,10 +43,7 @@ where
     const SERVER_HEADER: &'static str = concat!("ProSA-Hyper/", env!("CARGO_PKG_VERSION"));
 
     /// Create a new adaptor
-    fn new(
-        proc: &HyperServerProc<M>,
-        prosa_name: &str,
-    ) -> Result<Self, Box<dyn ProcError + Send + Sync>>
+    fn new(proc: &HyperServerProc<M>) -> Result<Self, Box<dyn ProcError + Send + Sync>>
     where
         Self: Sized;
 
@@ -74,15 +71,12 @@ where
         + std::marker::Sized
         + std::clone::Clone
         + std::fmt::Debug
-        + prosa_utils::msg::tvf::Tvf
+        + prosa::core::msg::Tvf
         + std::default::Default,
 {
-    fn new(
-        _proc: &HyperServerProc<M>,
-        prosa_name: &str,
-    ) -> Result<Self, Box<dyn ProcError + Send + Sync>> {
+    fn new(proc: &HyperServerProc<M>) -> Result<Self, Box<dyn ProcError + Send + Sync>> {
         Ok(HelloHyperServerAdaptor {
-            hello_msg: format!("Hello from {prosa_name}"),
+            hello_msg: format!("Hello from {}", proc.name()),
         })
     }
 
