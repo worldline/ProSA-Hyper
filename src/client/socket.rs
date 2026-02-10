@@ -28,7 +28,7 @@ use tokio::{
     task::JoinSet,
     time::{self, timeout},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{HyperProcError, client::adaptor::HyperClientAdaptor, hyper_version_str};
 
@@ -48,12 +48,11 @@ macro_rules! close_socket {
         $proc.remove_proc_queue($socket_id as u32).await?;
         while let Ok(msg) = $msg_queue.try_recv() {
             if let InternalMsg::Request(req_msg) = msg {
-                req_msg
+                let _ = req_msg
                     .return_error_to_sender(
                         None,
                         ServiceError::UnableToReachService($service_name.clone()),
-                    )
-                    .await?;
+                    );
             }
         }
         return $return;
@@ -82,7 +81,7 @@ impl HyperClientSocket {
     pub fn spawn<M, A>(
         mut self,
         join_set: &mut JoinSet<Result<Self, HyperProcError>>,
-        proc: ProcParam<M>,
+        proc: Arc<ProcParam<M>>,
         adaptor: Arc<A>,
         service_name: String,
         message_histogram: Histogram<u64>,
@@ -110,7 +109,7 @@ impl HyperClientSocket {
                 .await
                 {
                     Ok(Ok((sender, mut connection))) => {
-                        debug!(addr = target_addr, "Connected to HTTP2 remote");
+                        debug!(socket_id = socket_id, addr = target_addr, "Connected to HTTP2 remote");
                         let (tx_queue, mut rx_queue) = tokio::sync::mpsc::channel(2048);
                         proc.add_proc_queue(tx_queue, socket_id as u32).await?;
                         proc.add_service(vec![service_name.clone()], socket_id as u32)
@@ -120,7 +119,7 @@ impl HyperClientSocket {
                             tokio::select! {
                                 // Closed the socket
                                 Err(_) = &mut connection => {
-                                    debug!(addr = target_addr, "Remote HTTP2 close the socket");
+                                    debug!(socket_id = socket_id, addr = target_addr, "Remote HTTP2 close the socket");
                                     close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
                                 }
                                 // Receive a message to send from the queue
@@ -137,7 +136,7 @@ impl HyperClientSocket {
                                                 tokio::spawn(async move {
                                                     match adaptor.process_srv_request(data, &target_url) {
                                                         Ok(http_request) => {
-                                                            let _ = match timeout(self.http_timeout, sender.send_request(http_request)).await {
+                                                            match timeout(self.http_timeout, sender.send_request(http_request)).await {
                                                                 Ok(http_response) => {
                                                                     let (code, version) = http_response.as_ref().map_or((500, "HTTP/2"), |r| (r.status().as_u16() as i64, hyper_version_str(r.version())));
                                                                     message_histogram.record(
@@ -151,21 +150,21 @@ impl HyperClientSocket {
 
                                                                     match adaptor.process_http_response(http_response).await {
                                                                         Ok(response) => {
-                                                                            msg.return_to_sender(response).await
+                                                                            let _ = msg.return_to_sender(response);
                                                                         },
-                                                                        Err(e) => msg.return_error_to_sender(None, e).await,
+                                                                        Err(e) => { let _ = msg.return_error_to_sender(None, e); },
                                                                     }
                                                                 },
-                                                                Err(_) => msg.return_error_to_sender(None, ServiceError::Timeout(service_name.clone(), self.http_timeout.as_millis() as u64)).await,
+                                                                Err(_) => { let _ = msg.return_error_to_sender(None, ServiceError::Timeout(service_name.clone(), self.http_timeout.as_millis() as u64)); },
                                                             };
                                                         },
                                                         Err(e) => {
-                                                            let _ = msg.return_error_to_sender(None, e).await;
+                                                            let _ = msg.return_error_to_sender(None, e);
                                                         },
                                                     }
                                                 });
                                             } else {
-                                                msg.return_error_to_sender(None, ServiceError::UnableToReachService(service_name.clone())).await?;
+                                                let _ = msg.return_error_to_sender(None, ServiceError::UnableToReachService(service_name.clone()));
                                             }
                                         },
                                         InternalMsg::Response(msg) => panic!(
@@ -191,11 +190,12 @@ impl HyperClientSocket {
                         }
                     }
                     Ok(Err(e)) => {
-                        warn!(addr = target_addr, "HTTP2 handshake error: {}", e);
+                        warn!(socket_id = socket_id, addr = target_addr, "HTTP2 handshake error: {}", e);
                         Err(HyperProcError::Hyper(e, target_addr))
                     }
                     Err(_) => {
                         warn!(
+                            socket_id = socket_id,
                             addr = target_addr,
                             "HTTP2 handshake timeout after {} ms",
                             self.target.connect_timeout
@@ -217,7 +217,7 @@ impl HyperClientSocket {
                 .await
                 {
                     Ok(Ok((mut sender, mut connection))) => {
-                        debug!(addr = target_addr, "Connected to HTTP1 remote");
+                        debug!(socket_id = socket_id, addr = target_addr, "Connected to HTTP1 remote");
                         let (tx_queue, mut rx_queue) = tokio::sync::mpsc::channel(2048);
                         proc.add_proc_queue(tx_queue, socket_id as u32).await?;
                         proc.add_service(vec![service_name.clone()], socket_id as u32)
@@ -228,10 +228,11 @@ impl HyperClientSocket {
 
                         loop {
                             if let Some((msg, http_request)) = msg_to_send.take() {
+                                let http_log = http_request.uri().to_string();
                                 tokio::select! {
                                     // Closed the socket
                                     Err(_) = &mut connection => {
-                                        debug!(addr = target_addr, "Remote HTTP1 close the socket");
+                                        debug!(socket_id = socket_id, addr = target_addr, "Remote HTTP1 close the socket");
                                         close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
                                     }
                                     // Send an HTTP request
@@ -250,16 +251,16 @@ impl HyperClientSocket {
 
                                                 match adaptor.process_http_response(response).await {
                                                     Ok(r) => {
-                                                        msg.return_to_sender(r).await?;
+                                                        let _ = msg.return_to_sender(r);
                                                     },
                                                     Err(e) => {
-                                                        msg.return_error_to_sender(None, e).await?;
+                                                        let _ = msg.return_error_to_sender(None, e);
                                                     }
                                                 }
                                             },
-                                            Err(_) => {
-                                                debug!(addr = target_addr, "Message timeout after {} ms", self.http_timeout.as_millis());
-                                                msg.return_error_to_sender(None, ServiceError::Timeout(service_name.clone(), self.http_timeout.as_millis() as u64)).await?;
+                                            Err(elapsed) => {
+                                                info!(socket_id = socket_id, addr = target_addr, "Message timeout after {} ms: {:?} - {}", elapsed, msg, http_log);
+                                                let _ = msg.return_error_to_sender(None, ServiceError::Timeout(service_name.clone(), self.http_timeout.as_millis() as u64));
                                                 // Need to drop the connection because it's HTTP1
                                                 close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
                                             },
@@ -270,7 +271,7 @@ impl HyperClientSocket {
                                 tokio::select! {
                                     // Closed the socket
                                     Err(_) = &mut connection => {
-                                        debug!(addr = target_addr, "Remote close the socket");
+                                        debug!(socket_id = socket_id, addr = target_addr, "Remote close the socket");
                                         close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
                                     }
                                     // Receive a message to send from the queue
@@ -284,11 +285,11 @@ impl HyperClientSocket {
                                                             req_instant = Instant::now();
                                                         },
                                                         Err(e) => {
-                                                            msg.return_error_to_sender(None, e).await?;
+                                                            let _ = msg.return_error_to_sender(None, e);
                                                         },
                                                     }
                                                 } else {
-                                                    msg.return_error_to_sender(None, ServiceError::UnableToReachService(service_name.clone())).await?;
+                                                    let _ = msg.return_error_to_sender(None, ServiceError::UnableToReachService(service_name.clone()));
                                                 }
                                             },
                                             InternalMsg::Response(msg) => panic!(
@@ -315,11 +316,12 @@ impl HyperClientSocket {
                         }
                     }
                     Ok(Err(e)) => {
-                        warn!(addr = target_addr, "HTTP1 handshake error: {}", e);
+                        warn!(socket_id = socket_id, addr = target_addr, "HTTP1 handshake error: {}", e);
                         Err(HyperProcError::Hyper(e, target_addr))
                     }
                     Err(_) => {
                         warn!(
+                            socket_id = socket_id,
                             addr = target_addr,
                             "HTTP1 handshake timeout after {} ms",
                             self.target.connect_timeout
