@@ -153,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         1,
         String::from("hyper"),
         bus.clone(),
-        prosa_hyper_settings.hyper,
+        prosa_hyper_settings.hyper_server,
     );
     Proc::<HyperDemoAdaptor>::run(http_proc);
 

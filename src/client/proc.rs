@@ -88,9 +88,9 @@ where
     A: 'static + Adaptor + HyperClientAdaptor<M> + std::marker::Send + std::marker::Sync,
 {
     /// Main loop of the processor
-    async fn internal_run(&mut self, name: String) -> Result<(), Box<dyn ProcError + Send + Sync>> {
+    async fn internal_run(&mut self) -> Result<(), Box<dyn ProcError + Send + Sync>> {
         // Initiate an adaptor for the Hyper client processor
-        let adaptor = Arc::new(A::new(self, &name)?);
+        let adaptor = Arc::new(A::new(self)?);
 
         // Add proc main queue (id: 0)
         self.proc.add_proc().await?;
@@ -120,7 +120,7 @@ where
                         self.proc.clone(),
                         adaptor.clone(),
                         self.settings.service_name.clone(),
-                        observable_http_histogram.clone(),
+                        observable_http_histogram.clone()
                     );
                 }
             }
@@ -134,7 +134,7 @@ where
         observable_http_socket.record(
             client_sockets.len() as u64,
             &[
-                KeyValue::new("proc", name.clone()),
+                KeyValue::new("proc", self.name().to_string()),
                 KeyValue::new("service", self.settings.service_name.clone()),
             ],
         );
@@ -178,7 +178,7 @@ where
                                 self.proc.clone(),
                                 adaptor.clone(),
                                 self.settings.service_name.clone(),
-                                observable_http_histogram.clone(),
+                                observable_http_histogram.clone()
                             );
                         },
                         Err(e) =>  {
@@ -189,7 +189,7 @@ where
                     observable_http_socket.record(
                         client_sockets.len() as u64,
                         &[
-                            KeyValue::new("proc", name.clone()),
+                            KeyValue::new("proc", self.name().to_string()),
                             KeyValue::new("service", self.settings.service_name.clone()),
                         ],
                     );

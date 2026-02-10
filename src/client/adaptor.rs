@@ -43,7 +43,6 @@ where
     /// Create a new adaptor
     fn new(
         proc: &HyperClientProc<M>,
-        prosa_name: &str,
     ) -> Result<Self, Box<dyn ProcError + Send + Sync>>
     where
         Self: Sized;

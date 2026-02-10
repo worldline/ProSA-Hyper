@@ -42,14 +42,13 @@ where
         + std::default::Default,
 {
     fn new(
-        _proc: &prosa_hyper::client::proc::HyperClientProc<M>,
-        prosa_name: &str,
+        proc: &prosa_hyper::client::proc::HyperClientProc<M>,
     ) -> Result<Self, Box<dyn ProcError + Send + Sync>>
     where
         Self: Sized,
     {
         Ok(Self {
-            prosa_name: prosa_name.to_string(),
+            prosa_name: proc.name().to_string(),
         })
     }
 
@@ -164,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     prosa_hyper_settings.observability.tracing_init(&filter)?;
 
     // Create bus and main processor
-    let (bus, main) = MainProc::<SimpleStringTvf>::create(&prosa_hyper_settings);
+    let (bus, main) = MainProc::<SimpleStringTvf>::create(&prosa_hyper_settings, Some(2));
 
     // Launch the main task
     debug!("Launch the main task");
@@ -173,16 +172,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     debug!("Start the Hyper processor");
     let http_proc = HyperClientProc::<SimpleStringTvf>::create(
         1,
+        String::from("hyper_client"),
         bus.clone(),
         prosa_hyper_settings.hyper_client,
     );
-    Proc::<HyperDemoAdaptor>::run(http_proc, String::from("hyper_client"));
+    Proc::<HyperDemoAdaptor>::run(http_proc);
 
     if matches.contains_id("inj") && matches.get_flag("inj") {
         debug!("Start a Inj processor");
         let inj_settings = InjSettings::new(service_name);
-        let inj_proc = InjProc::<SimpleStringTvf>::create(2, bus.clone(), inj_settings);
-        Proc::<HyperDemoAdaptor>::run(inj_proc, String::from("INJ_PROC"));
+        let inj_proc = InjProc::<SimpleStringTvf>::create(2, String::from("INJ_PROC"), bus.clone(), inj_settings);
+        Proc::<HyperDemoAdaptor>::run(inj_proc);
     }
 
     // Wait on main task

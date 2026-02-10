@@ -9,7 +9,7 @@ edition = "2024"
 license = "LGPL-3.0-or-later"
 
 [features]
-default = ["server", "client"]
+default = ["client"]
 server = []
 client = []
 
