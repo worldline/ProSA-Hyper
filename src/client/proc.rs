@@ -91,7 +91,7 @@ where
         + std::marker::Sized
         + std::clone::Clone
         + std::fmt::Debug
-        + prosa_utils::msg::tvf::Tvf
+        + prosa::core::msg::Tvf
         + std::default::Default,
     A: 'static + Adaptor + HyperClientAdaptor<M> + std::marker::Send + std::marker::Sync,
 {

@@ -37,7 +37,6 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = ">=1.48, < 2", features = ["macros", "net", "rt", "rt-multi-thread"] }
 tracing = "0.1"
-prosa-utils = "0.4"
 prosa = "0.4"
 aquamarine = "0.6"
 url = { version = "2", features = ["serde"] }
@@ -49,6 +48,7 @@ http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["full"] }
 
 [dev-dependencies]
+prosa-utils = "0.4"
 openssl = ">=0.10.75, < 0.11"
 reqwest = { version = "0.13" }
 config = { version = "0.15", default-features = false, features = ["toml", "json", "yaml", "json5", "convert-case", "async"] }
