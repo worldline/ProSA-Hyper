@@ -30,7 +30,7 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use crate::{HyperProcError, client::adaptor::HyperClientAdaptor, hyper_version_str};
+use crate::{H2, HyperProcError, client::adaptor::HyperClientAdaptor, hyper_version_str};
 
 /// Hyper client socket
 #[derive(Debug, Clone)]
@@ -48,11 +48,10 @@ macro_rules! close_socket {
         $proc.remove_proc_queue($socket_id as u32).await?;
         while let Ok(msg) = $msg_queue.try_recv() {
             if let InternalMsg::Request(req_msg) = msg {
-                let _ = req_msg
-                    .return_error_to_sender(
-                        None,
-                        ServiceError::UnableToReachService($service_name.clone()),
-                    );
+                let _ = req_msg.return_error_to_sender(
+                    None,
+                    ServiceError::UnableToReachService($service_name.clone()),
+                );
             }
         }
         return $return;
@@ -63,6 +62,10 @@ impl HyperClientSocket {
     pub fn new(mut target: TargetSetting, http_timeout: u64) -> Self {
         // Set default protocol to HTTP2 if target enabled SSL
         if let Some(ssl) = target.ssl.as_mut() {
+            info!(
+                "Target {} enable SSL, set ALPN to support HTTP/2 and HTTP/1.1",
+                target.url
+            );
             ssl.set_alpn(vec!["h2".into(), "http/1.1".into()]);
         } else if url_is_ssl(&target.url) {
             let mut ssl = SslConfig::default();
@@ -100,7 +103,7 @@ impl HyperClientSocket {
             let io = TokioIo::new(self.target.connect().await?);
             let socket_id = io.inner().as_raw_fd();
             let target_addr = self.target.to_string();
-            if io.inner().selected_alpn_check(|alpn| alpn == b"h2") {
+            if io.inner().selected_alpn_check(|alpn| alpn == H2) {
                 self.is_http2 = true;
                 match time::timeout(
                     Duration::from_millis(self.target.connect_timeout),
@@ -220,6 +223,7 @@ impl HyperClientSocket {
                         debug!(socket_id = socket_id, addr = target_addr, "Connected to HTTP1 remote");
                         let (tx_queue, mut rx_queue) = tokio::sync::mpsc::channel(2048);
                         proc.add_proc_queue(tx_queue, socket_id as u32).await?;
+                        debug!(socket_id = socket_id, addr = target_addr, "HTTP client expose service name: {}", service_name);
                         proc.add_service(vec![service_name.clone()], socket_id as u32)
                             .await?;
                         #[allow(clippy::type_complexity)]
@@ -276,6 +280,7 @@ impl HyperClientSocket {
                                     }
                                     // Receive a message to send from the queue
                                     Some(msg) = rx_queue.recv() => {
+                                        debug!(socket_id = socket_id, addr = target_addr, "HTTP client receive a message to send: {:?}", msg);
                                         match msg {
                                             InternalMsg::Request(mut msg) => {
                                                 if let Some(data) = msg.take_data() {

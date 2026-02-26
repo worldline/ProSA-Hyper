@@ -12,39 +12,21 @@ mod tests {
     use bytes::Bytes;
     use http_body_util::{Full, combinators::BoxBody};
     use hyper::{Request, Response, StatusCode};
-    use openssl::{
-        asn1::{Asn1Integer, Asn1Time},
-        bn::{BigNum, MsbOption},
-        ec::{Asn1Flag, EcGroup, EcKey},
-        hash::MessageDigest,
-        nid::Nid,
-        pkey::PKey,
-        symm::Cipher,
-        x509::{X509, X509NameBuilder, extension::SubjectAlternativeName},
-    };
-    use prosa::{
-        core::{
-            adaptor::Adaptor,
-            error::ProcError,
-            main::{MainProc, MainRunnable as _},
-            proc::{Proc, ProcConfig as _},
-            settings::settings,
-        },
-        io::listener::ListenerSetting,
+    use prosa::core::{
+        adaptor::Adaptor,
+        error::ProcError,
+        main::{MainProc, MainRunnable as _},
+        proc::{Proc, ProcConfig as _},
     };
     use prosa_utils::{
-        config::{
-            ConfigError, os_country,
-            ssl::{SslConfig, Store},
-        },
+        config::ssl::{SslConfig, Store},
         msg::simple_string_tvf::SimpleStringTvf,
     };
     use reqwest::Certificate;
-    use serde::Serialize;
     use std::{
         env,
         fs::{self, File},
-        io::{Read as _, Write as _},
+        io::Read as _,
         time::Duration,
     };
     use tokio::time;
@@ -52,33 +34,11 @@ mod tests {
 
     use crate::{
         HyperResp,
-        server::{
-            adaptor::HyperServerAdaptor,
-            proc::{HyperServerProc, HyperServerSettings},
-        },
+        server::{adaptor::HyperServerAdaptor, proc::HyperServerProc},
+        tests::HttpTestSettings,
     };
 
     const WAIT_TIME: time::Duration = time::Duration::from_secs(5);
-
-    /// HTTP settings
-    #[settings]
-    #[derive(Default, Debug, Serialize)]
-    struct HttpTestSettings {
-        server: HyperServerSettings,
-    }
-
-    impl HttpTestSettings {
-        fn new(url: Url, server_ssl: Option<SslConfig>) -> Self {
-            let server = HyperServerSettings::new(
-                ListenerSetting::new(url.clone(), server_ssl),
-                Duration::from_secs(1),
-            );
-            HttpTestSettings {
-                server,
-                ..Default::default()
-            }
-        }
-    }
 
     #[derive(Adaptor, Clone)]
     struct ServerTestAdaptor {
@@ -187,84 +147,23 @@ mod tests {
     #[tokio::test]
     async fn http_client_server() {
         let test_settings =
-            HttpTestSettings::new(Url::parse("http://localhost:48080").unwrap(), None);
+            HttpTestSettings::new(Url::parse("http://localhost:48180").unwrap(), None, None);
 
         // Run a ProSA to test
         run_test(test_settings, None, false).await;
     }
 
-    /// Method to create private key and certificate for a server
-    fn create_server_cert(key_path: String, cert_path: String) -> Result<SslConfig, ConfigError> {
-        const PASSPHRASE: &str = "prosa_test";
-
-        let mut group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
-        group.set_asn1_flag(Asn1Flag::NAMED_CURVE);
-        let pkey = PKey::from_ec_key(EcKey::generate(&group)?)?;
-        let mut pkey_file =
-            File::create(key_path.clone()).map_err(|e| ConfigError::IoFile(key_path.clone(), e))?;
-        pkey_file
-            .write_all(&pkey.private_key_to_pem_pkcs8_passphrase(
-                Cipher::aes_256_cbc(),
-                PASSPHRASE.as_bytes(),
-            )?)
-            .map_err(|e| ConfigError::IoFile(key_path.clone(), e))?;
-
-        let mut cert = X509::builder()?;
-        cert.set_version(2)?;
-        cert.set_pubkey(&pkey)?;
-
-        let mut serial_bn = BigNum::new()?;
-        serial_bn.pseudo_rand(64, MsbOption::MAYBE_ZERO, true)?;
-        let serial_number = Asn1Integer::from_bn(&serial_bn)?;
-        cert.set_serial_number(&serial_number)?;
-
-        let begin_valid_time =
-            Asn1Time::from_unix(std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() as i64 - 360)?;
-        cert.set_not_before(&begin_valid_time)?;
-        let end_valid_time = Asn1Time::days_from_now(3)?; // 3 days from now
-        cert.set_not_after(&end_valid_time)?;
-
-        let mut x509_name = X509NameBuilder::new()?;
-        if let Some(cn) = os_country() {
-            x509_name.append_entry_by_text("C", cn.as_str())?;
-        }
-        x509_name.append_entry_by_text("CN", "ProSA-hyper")?;
-        let x509_name = x509_name.build();
-        cert.set_subject_name(&x509_name)?;
-        cert.set_issuer_name(&x509_name)?;
-
-        let mut subject_alternative_name = SubjectAlternativeName::new();
-        let x509_extension = subject_alternative_name
-            .dns("localhost")
-            .build(&cert.x509v3_context(None, None))?;
-        cert.append_extension2(&x509_extension)?;
-
-        cert.sign(&pkey, MessageDigest::sha256())?;
-
-        let mut cert_file = File::create(cert_path.clone())
-            .map_err(|e| ConfigError::IoFile(cert_path.clone(), e))?;
-        cert_file
-            .write_all(&cert.build().to_pem()?)
-            .map_err(|e| ConfigError::IoFile(cert_path.clone(), e))?;
-
-        Ok(SslConfig::new_cert_key(
-            cert_path,
-            key_path,
-            Some(PASSPHRASE.into()),
-        ))
-    }
-
     #[tokio::test]
     async fn https_client_server() {
-        const PROSA_HTTPS_TEST_DIR_NAME: &str = "ProSA_HTTPS";
+        const PROSA_HTTPS_TEST_DIR_NAME: &str = "ProSA_server_HTTPS";
         let prosa_temp_dir = env::temp_dir().join(PROSA_HTTPS_TEST_DIR_NAME);
 
         let _ = fs::remove_dir_all(&prosa_temp_dir);
         fs::create_dir_all(&prosa_temp_dir).unwrap();
 
-        let key_path = prosa_temp_dir.join("prosa_https.key");
-        let cert_path = prosa_temp_dir.join("prosa_https.pem");
-        let server_ssl_config = create_server_cert(
+        let key_path = prosa_temp_dir.join("prosa_server_https.key");
+        let cert_path = prosa_temp_dir.join("prosa_server_https.pem");
+        let server_ssl_config = HttpTestSettings::create_server_cert(
             key_path.as_os_str().to_str().unwrap().into(),
             cert_path.as_os_str().to_str().unwrap().into(),
         )
@@ -284,8 +183,9 @@ mod tests {
         client_ssl_config.set_store(client_ssl_store);
 
         let test_settings = HttpTestSettings::new(
-            Url::parse("https://localhost:48443").unwrap(),
+            Url::parse("https://localhost:48543").unwrap(),
             Some(server_ssl_config),
+            Some(client_ssl_config),
         );
 
         // Run a ProSA to test
@@ -294,15 +194,15 @@ mod tests {
 
     #[tokio::test]
     async fn h2_client_server() {
-        const PROSA_H2_TEST_DIR_NAME: &str = "ProSA_H2";
+        const PROSA_H2_TEST_DIR_NAME: &str = "ProSA_server_H2";
         let prosa_temp_dir = env::temp_dir().join(PROSA_H2_TEST_DIR_NAME);
 
         let _ = fs::remove_dir_all(&prosa_temp_dir);
         fs::create_dir_all(&prosa_temp_dir).unwrap();
 
-        let key_path = prosa_temp_dir.join("prosa_h2.key");
-        let cert_path = prosa_temp_dir.join("prosa_h2.pem");
-        let mut server_ssl_config = create_server_cert(
+        let key_path = prosa_temp_dir.join("prosa_server_h2.key");
+        let cert_path = prosa_temp_dir.join("prosa_server_h2.pem");
+        let mut server_ssl_config = HttpTestSettings::create_server_cert(
             key_path.as_os_str().to_str().unwrap().into(),
             cert_path.as_os_str().to_str().unwrap().into(),
         )
@@ -317,9 +217,17 @@ mod tests {
             .unwrap();
         let client_cert = reqwest::Certificate::from_pem(&buf).unwrap();
 
+        let client_ssl_store = Store::File {
+            path: format!("{}/", prosa_temp_dir.as_os_str().to_str().unwrap()),
+        };
+        let mut client_ssl_config = SslConfig::default();
+        client_ssl_config.set_store(client_ssl_store);
+        client_ssl_config.set_alpn(vec!["h2".into()]);
+
         let test_settings = HttpTestSettings::new(
-            Url::parse("https://localhost:49443").unwrap(),
+            Url::parse("https://localhost:49543").unwrap(),
             Some(server_ssl_config),
+            Some(client_ssl_config),
         );
 
         // Run a ProSA to test

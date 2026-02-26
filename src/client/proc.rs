@@ -51,6 +51,14 @@ impl HyperClientSettings {
         5000
     }
 
+    /// Create a new Hyper client settings listenning to a service
+    pub fn new(service_name: String) -> Self {
+        HyperClientSettings {
+            service_name,
+            ..Default::default()
+        }
+    }
+
     /// Add a new Hyper client backend
     pub fn add_backend(&mut self, target: TargetSetting) {
         self.backends.push(target);
@@ -120,7 +128,7 @@ where
                         self.proc.clone(),
                         adaptor.clone(),
                         self.settings.service_name.clone(),
-                        observable_http_histogram.clone()
+                        observable_http_histogram.clone(),
                     );
                 }
             }

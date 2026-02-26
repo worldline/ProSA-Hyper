@@ -96,3 +96,7 @@ pub mod server;
 
 #[cfg(feature = "client")]
 pub mod client;
+
+#[cfg(any(feature = "server", feature = "client"))]
+#[cfg(test)]
+pub mod tests;

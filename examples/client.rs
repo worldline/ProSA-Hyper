@@ -181,7 +181,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches.contains_id("inj") && matches.get_flag("inj") {
         debug!("Start a Inj processor");
         let inj_settings = InjSettings::new(service_name);
-        let inj_proc = InjProc::<SimpleStringTvf>::create(2, String::from("INJ_PROC"), bus.clone(), inj_settings);
+        let inj_proc = InjProc::<SimpleStringTvf>::create(
+            2,
+            String::from("INJ_PROC"),
+            bus.clone(),
+            inj_settings,
+        );
         Proc::<HyperDemoAdaptor>::run(inj_proc);
     }
 

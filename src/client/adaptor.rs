@@ -41,9 +41,7 @@ where
     const USER_AGENT_HEADER: &'static str = concat!("ProSA-Hyper/", env!("CARGO_PKG_VERSION"));
 
     /// Create a new adaptor
-    fn new(
-        proc: &HyperClientProc<M>,
-    ) -> Result<Self, Box<dyn ProcError + Send + Sync>>
+    fn new(proc: &HyperClientProc<M>) -> Result<Self, Box<dyn ProcError + Send + Sync>>
     where
         Self: Sized;
 
