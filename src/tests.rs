@@ -124,6 +124,7 @@ impl HttpTestSettings {
     }
 }
 
+#[allow(clippy::module_inception)]
 #[cfg(all(feature = "server", feature = "client"))]
 mod tests {
     use bytes::Bytes;
