@@ -103,7 +103,7 @@ where
 #[settings]
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub(crate) struct MainHyperSettings {
-    pub(crate) hyper: HyperServerSettings,
+    pub(crate) hyper_server: HyperServerSettings,
 }
 
 #[tokio::main]
@@ -116,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .arg(arg!(-s --stub "Start a Stub processor").action(ArgAction::SetTrue))
         .arg(
             arg!(-c --config <CONFIG_PATH> "Path of the Hyper ProSA server configuration file")
-                .default_value("examples/server.yml"),
+                .default_value("examples/config.yml"),
         )
         .get_matches();
 
@@ -153,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         1,
         String::from("hyper"),
         bus.clone(),
-        prosa_hyper_settings.hyper,
+        prosa_hyper_settings.hyper_server,
     );
     Proc::<HyperDemoAdaptor>::run(http_proc);
 

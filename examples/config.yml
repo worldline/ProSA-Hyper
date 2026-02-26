@@ -1,8 +1,20 @@
 
-hyper:
+hyper_server:
   listener:
-    url: https://0.0.0.0:8443
+    url: https://localhost:8443
+    ssl:
+      cert: "examples/self_signed_cert.pem"
     max_socket: 20
+
+hyper_client:
+  service_name: "hyper_service"
+  backends:
+    - url: https://localhost:8443
+      ssl:
+        store:
+          path: "examples/"
+  min_socket: 2
+  max_socket: 20
 
 observability:
   level: DEBUG
