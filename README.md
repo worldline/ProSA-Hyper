@@ -38,6 +38,23 @@ http_server:
 
 If you have some slow services, you can set the `service_timeout` parameter (800 ms by default).
 
+### Client
+
+The client exposes a service if it is available.
+For backends, you need to use [TargetSetting](https://docs.rs/prosa/latest/prosa/io/stream/struct.TargetSetting.html).
+All backends will be load-balanced with ProSA's internal service load balancing.
+
+```yaml
+http_client:
+  service_name: "service_name"
+  min_socket: 1
+  max_socket: 20
+  backends:
+    - url: http://backend01:8080
+```
+
+If you have a slow backend response, you can set the `http_timeout` parameter (5 seconds by default).
+
 ## Examples
 
 ### Server
@@ -47,7 +64,7 @@ To get help on the processor command-line arguments, run:
 cargo run --example server -- -h
 ```
 
-If you run it without any parameters, it'll start an HTTPS server using the configuration in _examples/server.yml_:
+If you run it without any parameters, it'll start an HTTPS server using the configuration in _examples/config.yml_:
 ```sh
 cargo run --example server
 ```
@@ -56,3 +73,15 @@ The server provides the following targets:
  - [/](http://localhost:8080/) returns the ProSA name
  - [/test](http://localhost:8080/test) contacts an internal service named SRV_TEST (requires starting the stub processor)
  - [metrics](http://localhost:9090/metrics) exposes Prometheus metrics as configured
+
+### Client
+
+To get help on the processor command-line arguments, run:
+```sh
+cargo run --example client -- -h
+```
+
+If you run it without any parameters, it will start an HTTPS client connecting to the HTTP server example using the same configuration in _examples/config.yml_:
+```sh
+cargo run --example client
+```
