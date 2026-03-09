@@ -11,7 +11,7 @@ use crate::HyperResp;
 use super::proc::HyperServerProc;
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
-/// Trait to define the Hyper adaptor structure
+/// Trait to define the Hyper server adaptor structure
 ///
 /// ```mermaid
 /// graph LR

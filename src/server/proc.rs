@@ -116,11 +116,11 @@ where
         let meter = self.get_proc_param().meter("hyper_server");
         let observable_http_counter = meter
             .u64_counter("prosa_hyper_srv_count")
-            .with_description("Hyper HTTP counter")
+            .with_description("Hyper HTTP server counter")
             .build();
         let observable_http_socket = meter
             .i64_up_down_counter("prosa_hyper_srv_socket")
-            .with_description("Hyper HTTP socket counter")
+            .with_description("Hyper HTTP server socket counter")
             .build();
 
         let listener = Arc::new(self.settings.listener.bind().await?);
