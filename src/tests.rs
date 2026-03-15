@@ -157,7 +157,7 @@ mod tests {
     use url::Url;
 
     use crate::{
-        HyperResp,
+        HttpError, HyperResp,
         client::{adaptor::HyperClientAdaptor, proc::HyperClientProc},
         server::{adaptor::HyperServerAdaptor, proc::HyperServerProc},
         tests::HttpTestSettings,
@@ -271,8 +271,11 @@ mod tests {
         fn process_srv_response(
             &self,
             resp: M,
-        ) -> hyper::Response<
-            http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>,
+        ) -> Result<
+            hyper::Response<
+                http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>,
+            >,
+            HttpError,
         > {
             if let Ok(content) = resp.get_string(1) {
                 Response::builder()
@@ -284,7 +287,7 @@ mod tests {
                     .body(BoxBody::new(Full::new(Bytes::from_owner(
                         content.into_owned(),
                     ))))
-                    .unwrap()
+                    .map_err(|e| e.into())
             } else {
                 Response::builder()
                     .header(
@@ -293,7 +296,7 @@ mod tests {
                     )
                     .status(StatusCode::BAD_REQUEST)
                     .body(BoxBody::new(Full::new(Bytes::from("Bad Request"))))
-                    .unwrap()
+                    .map_err(|e| e.into())
             }
         }
     }

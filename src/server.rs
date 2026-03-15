@@ -11,7 +11,7 @@ pub(crate) mod service;
 mod tests {
     use bytes::Bytes;
     use http_body_util::{Full, combinators::BoxBody};
-    use hyper::{Request, Response, StatusCode};
+    use hyper::{Request, StatusCode};
     use prosa::core::{
         adaptor::Adaptor,
         error::ProcError,
@@ -33,7 +33,7 @@ mod tests {
     use url::Url;
 
     use crate::{
-        HyperResp,
+        HttpError, HyperResp,
         server::{adaptor::HyperServerAdaptor, proc::HyperServerProc},
         tests::HttpTestSettings,
     };
@@ -71,23 +71,19 @@ mod tests {
             } else {
                 "Hello, world"
             };
-            let response = Response::builder()
-                .header(
-                    hyper::header::SERVER,
-                    <ServerTestAdaptor as HyperServerAdaptor<M>>::SERVER_HEADER,
-                )
-                .status(StatusCode::OK)
+            <ServerTestAdaptor as HyperServerAdaptor<M>>::response_builder(self, StatusCode::OK)
                 .body(BoxBody::new(Full::new(Bytes::from(resp_msg))))
-                .unwrap();
-
-            HyperResp::HttpResp(response)
+                .into()
         }
 
         fn process_srv_response(
             &self,
             _resp: M,
-        ) -> hyper::Response<
-            http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>,
+        ) -> Result<
+            hyper::Response<
+                http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>,
+            >,
+            HttpError,
         > {
             unimplemented!()
         }
@@ -133,7 +129,11 @@ mod tests {
                 .expect("Failed to send request");
             assert_eq!(resp.status(), StatusCode::OK);
             let server_header = resp.headers().get(hyper::header::SERVER).unwrap();
-            assert!(server_header.to_str().unwrap().starts_with("ProSA-Hyper/"));
+            assert!(server_header.to_str().unwrap().starts_with(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            )));
         }
 
         bus.stop("ProSA HTTP client server unit test end".into())

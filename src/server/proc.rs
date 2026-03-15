@@ -164,7 +164,7 @@ where
                     {
                         let request = RequestMsg::new(http_msg.get_service().clone(), http_msg_data, self.proc.get_service_queue().clone());
                         let request_id = request.get_id();
-                        service.proc_queue.send(InternalMsg::Request(request)).await.unwrap();
+                        service.proc_queue.send(InternalMsg::Request(request)).await?;
                         pending_req.push_with_id(request_id, http_msg, self.settings.service_timeout);
                     } else {
                         warn!(
