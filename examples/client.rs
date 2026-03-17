@@ -66,10 +66,7 @@ where
 
         Request::builder()
             .uri(uri.as_str())
-            .header(
-                "User-Agent",
-                PRODUCT_VERSION_HEADER,
-            )
+            .header("User-Agent", PRODUCT_VERSION_HEADER)
             .body(BoxBody::new(Empty::<Bytes>::new()))
             .map_err(|e| ServiceError::ProtocolError(format!("Failed to build request: {}", e)))
     }

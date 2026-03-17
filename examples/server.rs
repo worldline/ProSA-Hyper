@@ -53,10 +53,7 @@ where
     ) -> crate::HyperResp<M> {
         match req.uri().path() {
             "/" => Response::builder()
-                .header(
-                    "Server",
-                    PRODUCT_VERSION_HEADER,
-                )
+                .header("Server", PRODUCT_VERSION_HEADER)
                 .body(BoxBody::new(Full::new(Bytes::from(format!(
                     "{} - Home of {}",
                     if req.version() == hyper::Version::HTTP_2 {
@@ -75,10 +72,7 @@ where
             }
             _ => Response::builder()
                 .status(404)
-                .header(
-                    "Server",
-                    PRODUCT_VERSION_HEADER,
-                )
+                .header("Server", PRODUCT_VERSION_HEADER)
                 .body(BoxBody::new(Full::new(Bytes::from("Not Found"))))
                 .into(),
         }

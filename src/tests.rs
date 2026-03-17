@@ -157,7 +157,10 @@ mod tests {
     use url::Url;
 
     use crate::{
-        HttpError, HyperResp, PRODUCT_VERSION_HEADER, client::{adaptor::HyperClientAdaptor, proc::HyperClientProc}, server::{adaptor::HyperServerAdaptor, proc::HyperServerProc}, tests::HttpTestSettings
+        HttpError, HyperResp, PRODUCT_VERSION_HEADER,
+        client::{adaptor::HyperClientAdaptor, proc::HyperClientProc},
+        server::{adaptor::HyperServerAdaptor, proc::HyperServerProc},
+        tests::HttpTestSettings,
     };
 
     const WAIT_TIME: time::Duration = time::Duration::from_secs(1);
@@ -276,10 +279,7 @@ mod tests {
         > {
             if let Ok(content) = resp.get_string(1) {
                 Response::builder()
-                    .header(
-                        hyper::header::SERVER,
-                        PRODUCT_VERSION_HEADER,
-                    )
+                    .header(hyper::header::SERVER, PRODUCT_VERSION_HEADER)
                     .status(StatusCode::OK)
                     .body(BoxBody::new(Full::new(Bytes::from_owner(
                         content.into_owned(),
@@ -287,10 +287,7 @@ mod tests {
                     .map_err(|e| e.into())
             } else {
                 Response::builder()
-                    .header(
-                        hyper::header::SERVER,
-                        PRODUCT_VERSION_HEADER,
-                    )
+                    .header(hyper::header::SERVER, PRODUCT_VERSION_HEADER)
                     .status(StatusCode::BAD_REQUEST)
                     .body(BoxBody::new(Full::new(Bytes::from("Bad Request"))))
                     .map_err(|e| e.into())
@@ -393,10 +390,7 @@ mod tests {
                 Ok(body) => Request::builder()
                     .method(Method::POST)
                     .uri(socket_url.as_str())
-                    .header(
-                        hyper::header::USER_AGENT,
-                        PRODUCT_VERSION_HEADER,
-                    )
+                    .header(hyper::header::USER_AGENT, PRODUCT_VERSION_HEADER)
                     .body(BoxBody::new(Full::new(Bytes::from(body.into_owned()))))
                     .map_err(|e| {
                         ServiceError::ProtocolError(format!("Failed to build request: {}", e))

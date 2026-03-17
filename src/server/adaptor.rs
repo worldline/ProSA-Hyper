@@ -114,10 +114,7 @@ where
     async fn process_http_request(&self, _req: Request<hyper::body::Incoming>) -> HyperResp<M> {
         Response::builder()
             .status(200)
-            .header(
-                "Server",
-                PRODUCT_VERSION_HEADER,
-            )
+            .header("Server", PRODUCT_VERSION_HEADER)
             .body(BoxBody::new(Full::new(Bytes::from(self.hello_msg.clone()))))
             .into()
     }

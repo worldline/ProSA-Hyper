@@ -35,6 +35,9 @@ use tracing::{debug, info, warn};
 
 use crate::{H2, HyperProcError, client::adaptor::HyperClientAdaptor, hyper_version_str};
 
+/// Type alias for HTTP request pair to reduce type complexity
+type HttpRequestPair<M> = (RequestMsg<M>, Request<BoxBody<Bytes, Infallible>>);
+
 /// Hyper client socket
 #[derive(Debug, Clone)]
 pub struct HyperClientSocket {
@@ -112,7 +115,7 @@ impl HyperClientSocket {
         mut msg: RequestMsg<M>,
         target_url: &url::Url,
         service_name: &str,
-    ) -> Option<(RequestMsg<M>, Request<BoxBody<Bytes, Infallible>>)>
+    ) -> Option<HttpRequestPair<M>>
     where
         M: 'static
             + std::marker::Send
@@ -216,11 +219,7 @@ impl HyperClientSocket {
                     "HTTP client expose service name: {}",
                     service_name
                 );
-                #[allow(clippy::type_complexity)]
-                let mut msg_to_send: Option<(
-                    RequestMsg<M>,
-                    Request<BoxBody<Bytes, Infallible>>,
-                )> = None;
+                let mut msg_to_send: Option<HttpRequestPair<M>> = None;
                 let mut req_instant = Instant::now();
 
                 loop {
