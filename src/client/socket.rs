@@ -83,6 +83,97 @@ impl HyperClientSocket {
         }
     }
 
+    /// Helper to setup socket queue and service registration
+    async fn setup_socket_queue<M>(
+        proc: &Arc<ProcParam<M>>,
+        socket_id: u32,
+        service_name: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<InternalMsg<M>>, HyperProcError>
+    where
+        M: 'static
+            + std::marker::Send
+            + std::marker::Sync
+            + std::marker::Sized
+            + std::clone::Clone
+            + std::fmt::Debug
+            + prosa::core::msg::Tvf
+            + std::default::Default,
+    {
+        let (tx_queue, rx_queue) = tokio::sync::mpsc::channel(2048);
+        proc.add_proc_queue(tx_queue, socket_id).await?;
+        proc.add_service(vec![service_name.to_string()], socket_id)
+            .await?;
+        Ok(rx_queue)
+    }
+
+    /// Helper to process a service request into an HTTP request
+    fn process_request<M, A>(
+        adaptor: &Arc<A>,
+        mut msg: RequestMsg<M>,
+        target_url: &url::Url,
+        service_name: &str,
+    ) -> Option<(RequestMsg<M>, Request<BoxBody<Bytes, Infallible>>)>
+    where
+        M: 'static
+            + std::marker::Send
+            + std::marker::Sync
+            + std::marker::Sized
+            + std::clone::Clone
+            + std::fmt::Debug
+            + prosa::core::msg::Tvf
+            + std::default::Default,
+        A: 'static + HyperClientAdaptor<M> + std::marker::Send + std::marker::Sync,
+    {
+        if let Some(data) = msg.take_data() {
+            match adaptor.process_srv_request(data, target_url) {
+                Ok(http_request) => Some((msg, http_request)),
+                Err(e) => {
+                    let _ = msg.return_error_to_sender(None, e);
+                    None
+                }
+            }
+        } else {
+            let _ = msg.return_error_to_sender(
+                None,
+                ServiceError::UnableToReachService(service_name.to_string()),
+            );
+            None
+        }
+    }
+
+    /// Helper to handle handshake timeout errors
+    fn handle_handshake_timeout(
+        socket_id: i32,
+        target_addr: &str,
+        timeout_ms: u64,
+        protocol: &str,
+    ) -> HyperProcError {
+        warn!(
+            socket_id = socket_id,
+            addr = target_addr,
+            "{protocol} handshake timeout after {timeout_ms} ms"
+        );
+        HyperProcError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{protocol} handshake timeout after {timeout_ms} ms"),
+        ))
+    }
+
+    /// Helper to handle handshake errors
+    fn handle_handshake_error(
+        socket_id: i32,
+        target_addr: &str,
+        error: hyper::Error,
+        protocol: &str,
+    ) -> HyperProcError {
+        warn!(
+            socket_id = socket_id,
+            addr = target_addr,
+            "{protocol} handshake error: {error}"
+        );
+        HyperProcError::Hyper(error, target_addr.to_string())
+    }
+
     /// Method to spawn a task that handle the Hyper client socket with HTTP/1.1
     async fn spawn_http1<M, A>(
         self,
@@ -117,16 +208,14 @@ impl HyperClientSocket {
                     addr = target_addr,
                     "Connected to HTTP1 remote"
                 );
-                let (tx_queue, mut rx_queue) = tokio::sync::mpsc::channel(2048);
-                proc.add_proc_queue(tx_queue, socket_id as u32).await?;
+                let mut rx_queue =
+                    Self::setup_socket_queue(&proc, socket_id as u32, &service_name).await?;
                 debug!(
                     socket_id = socket_id,
                     addr = target_addr,
                     "HTTP client expose service name: {}",
                     service_name
                 );
-                proc.add_service(vec![service_name.clone()], socket_id as u32)
-                    .await?;
                 #[allow(clippy::type_complexity)]
                 let mut msg_to_send: Option<(
                     RequestMsg<M>,
@@ -186,33 +275,25 @@ impl HyperClientSocket {
                             Some(msg) = rx_queue.recv() => {
                                 debug!(socket_id = socket_id, addr = target_addr, "HTTP client receive a message to send: {:?}", msg);
                                 match msg {
-                                    InternalMsg::Request(mut msg) => {
-                                        if let Some(data) = msg.take_data() {
-                                            match adaptor.process_srv_request(data, &self.target.url) {
-                                                Ok(http_request) => {
-                                                    msg_to_send = Some((msg, http_request));
-                                                    req_instant = Instant::now();
-                                                },
-                                                Err(e) => {
-                                                    let _ = msg.return_error_to_sender(None, e);
-                                                },
-                                            }
-                                        } else {
-                                            let _ = msg.return_error_to_sender(None, ServiceError::UnableToReachService(service_name.clone()));
+                                    InternalMsg::Request(req_msg) => {
+                                        if let Some(result) = Self::process_request(&adaptor, req_msg, &self.target.url, &service_name) {
+                                            msg_to_send = Some(result);
+                                            req_instant = Instant::now();
                                         }
                                     },
                                     InternalMsg::Response(msg) => panic!(
-                                        "The hyper client socket {}/{socket_id} receive a response {:?}",
+                                        "The HTTP1 hyper client socket {}/{socket_id} receive a response {:?}",
                                         proc.get_proc_id(),
                                         msg
                                     ),
                                     InternalMsg::Error(err_msg) => panic!(
-                                        "The hyper client socket {}/{socket_id} receive an error {:?}",
+                                        "The HTTP1 hyper client socket {}/{socket_id} receive an error {:?}",
                                         proc.get_proc_id(),
                                         err_msg
                                     ),
-                                    InternalMsg::Command(_) => todo!(),
-                                    InternalMsg::Config => todo!(),
+                                    InternalMsg::Command(_) | InternalMsg::Config => {
+                                        // TODO: Implement Command/Config handling or document as unsupported
+                                    },
                                     InternalMsg::Service(_table) => {/* Will not use service table */},
                                     InternalMsg::Shutdown => {
                                         // Remove the socket queue and wait message to finish
@@ -224,30 +305,18 @@ impl HyperClientSocket {
                     }
                 }
             }
-            Ok(Err(e)) => {
-                warn!(
-                    socket_id = socket_id,
-                    addr = target_addr,
-                    "HTTP1 handshake error: {}",
-                    e
-                );
-                Err(HyperProcError::Hyper(e, target_addr))
-            }
-            Err(_) => {
-                warn!(
-                    socket_id = socket_id,
-                    addr = target_addr,
-                    "HTTP1 handshake timeout after {} ms",
-                    self.target.connect_timeout
-                );
-                Err(HyperProcError::Io(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "HTTP1 handshake timeout after {} ms",
-                        self.target.connect_timeout
-                    ),
-                )))
-            }
+            Ok(Err(e)) => Err(Self::handle_handshake_error(
+                socket_id,
+                &target_addr,
+                e,
+                "HTTP1",
+            )),
+            Err(_) => Err(Self::handle_handshake_timeout(
+                socket_id,
+                &target_addr,
+                self.target.connect_timeout,
+                "HTTP1",
+            )),
         }
     }
 
@@ -286,10 +355,8 @@ impl HyperClientSocket {
                     addr = target_addr,
                     "Connected to HTTP2 remote"
                 );
-                let (tx_queue, mut rx_queue) = tokio::sync::mpsc::channel(2048);
-                proc.add_proc_queue(tx_queue, socket_id as u32).await?;
-                proc.add_service(vec![service_name.clone()], socket_id as u32)
-                    .await?;
+                let mut rx_queue =
+                    Self::setup_socket_queue(&proc, socket_id as u32, &service_name).await?;
 
                 loop {
                     tokio::select! {
@@ -301,18 +368,20 @@ impl HyperClientSocket {
                         // Receive a message to send from the queue
                         Some(msg) = rx_queue.recv() => {
                             match msg {
-                                InternalMsg::Request(mut msg) => {
-                                    if let Some(data) = msg.take_data() {
+                                InternalMsg::Request(mut req_msg) => {
+                                    if let Some(data) = req_msg.take_data() {
                                         let req_instant = Instant::now();
                                         let mut sender = sender.clone();
                                         let adaptor = adaptor.clone();
                                         let target_url = self.target.url.clone();
-                                        let service_name = service_name.clone();
                                         let message_histogram = message_histogram.clone();
+                                        let http_timeout = self.http_timeout;
+                                        let service_name_clone = service_name.clone();
+
                                         tokio::spawn(async move {
                                             match adaptor.process_srv_request(data, &target_url) {
                                                 Ok(http_request) => {
-                                                    match timeout(self.http_timeout, sender.send_request(http_request)).await {
+                                                    match timeout(http_timeout, sender.send_request(http_request)).await {
                                                         Ok(http_response) => {
                                                             let (code, version) = http_response.as_ref().map_or((500, "HTTP/2"), |r| (r.status().as_u16() as i64, hyper_version_str(r.version())));
                                                             message_histogram.record(
@@ -326,35 +395,36 @@ impl HyperClientSocket {
 
                                                             match adaptor.process_http_response(http_response).await {
                                                                 Ok(response) => {
-                                                                    let _ = msg.return_to_sender(response);
+                                                                    let _ = req_msg.return_to_sender(response);
                                                                 },
-                                                                Err(e) => { let _ = msg.return_error_to_sender(None, e); },
+                                                                Err(e) => { let _ = req_msg.return_error_to_sender(None, e); },
                                                             }
                                                         },
-                                                        Err(_) => { let _ = msg.return_error_to_sender(None, ServiceError::Timeout(service_name.clone(), self.http_timeout.as_millis() as u64)); },
+                                                        Err(_) => { let _ = req_msg.return_error_to_sender(None, ServiceError::Timeout(service_name_clone, http_timeout.as_millis() as u64)); },
                                                     };
                                                 },
                                                 Err(e) => {
-                                                    let _ = msg.return_error_to_sender(None, e);
+                                                    let _ = req_msg.return_error_to_sender(None, e);
                                                 },
                                             }
                                         });
                                     } else {
-                                        let _ = msg.return_error_to_sender(None, ServiceError::UnableToReachService(service_name.clone()));
+                                        let _ = req_msg.return_error_to_sender(None, ServiceError::UnableToReachService(service_name.clone()));
                                     }
                                 },
                                 InternalMsg::Response(msg) => panic!(
-                                    "The hyper client socket {}/{socket_id} receive a response {:?}",
+                                    "The H2 hyper client socket {}/{socket_id} receive a response {:?}",
                                     proc.get_proc_id(),
                                     msg
                                 ),
                                 InternalMsg::Error(err_msg) => panic!(
-                                    "The hyper client socket {}/{socket_id} receive an error {:?}",
+                                    "The H2 hyper client socket {}/{socket_id} receive an error {:?}",
                                     proc.get_proc_id(),
                                     err_msg
                                 ),
-                                InternalMsg::Command(_) => todo!(),
-                                InternalMsg::Config => todo!(),
+                                InternalMsg::Command(_) | InternalMsg::Config => {
+                                    // TODO: Implement Command/Config handling or document as unsupported
+                                },
                                 InternalMsg::Service(_table) => {/* Will not use service table */},
                                 InternalMsg::Shutdown => {
                                     // Remove the socket queue and wait message to finish
@@ -365,30 +435,18 @@ impl HyperClientSocket {
                     }
                 }
             }
-            Ok(Err(e)) => {
-                warn!(
-                    socket_id = socket_id,
-                    addr = target_addr,
-                    "HTTP2 handshake error: {}",
-                    e
-                );
-                Err(HyperProcError::Hyper(e, target_addr))
-            }
-            Err(_) => {
-                warn!(
-                    socket_id = socket_id,
-                    addr = target_addr,
-                    "HTTP2 handshake timeout after {} ms",
-                    self.target.connect_timeout
-                );
-                Err(HyperProcError::Io(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "HTTP2 handshake timeout after {} ms",
-                        self.target.connect_timeout
-                    ),
-                )))
-            }
+            Ok(Err(e)) => Err(Self::handle_handshake_error(
+                socket_id,
+                &target_addr,
+                e,
+                "HTTP2",
+            )),
+            Err(_) => Err(Self::handle_handshake_timeout(
+                socket_id,
+                &target_addr,
+                self.target.connect_timeout,
+                "HTTP2",
+            )),
         }
     }
 

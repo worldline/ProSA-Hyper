@@ -7,7 +7,7 @@ use http_body_util::{Empty, Full, combinators::BoxBody};
 use hyper::{Request, Response, StatusCode};
 use prosa::core::{adaptor::Adaptor, error::ProcError, msg::ErrorMsg, proc::ProcBusParam as _};
 
-use crate::{HttpError, HyperResp};
+use crate::{HttpError, HyperResp, PRODUCT_VERSION_HEADER};
 
 use super::proc::HyperServerProc;
 
@@ -33,25 +33,6 @@ where
         + prosa::core::msg::Tvf
         + std::default::Default,
 {
-    /// Server header value send by the server
-    #[cfg(target_family = "unix")]
-    const SERVER_HEADER: &'static str = concat!(
-        env!("CARGO_PKG_NAME"),
-        "/",
-        env!("CARGO_PKG_VERSION"),
-        " (Unix)"
-    );
-    #[cfg(target_family = "windows")]
-    const SERVER_HEADER: &'static str = concat!(
-        env!("CARGO_PKG_NAME"),
-        "/",
-        env!("CARGO_PKG_VERSION"),
-        " (Windows)"
-    );
-    #[cfg(all(not(target_family = "unix"), not(target_family = "windows")))]
-    const SERVER_HEADER: &'static str =
-        concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
-
     /// Create a new adaptor
     fn new(proc: &HyperServerProc<M>) -> Result<Self, Box<dyn ProcError + Send + Sync>>
     where
@@ -66,7 +47,7 @@ where
     {
         Response::builder()
             .status(status_code)
-            .header(hyper::header::SERVER, Self::SERVER_HEADER)
+            .header(hyper::header::SERVER, PRODUCT_VERSION_HEADER)
     }
 
     /// Method to process input HTTP requests. Received by the ProSA through Hyper
@@ -135,7 +116,7 @@ where
             .status(200)
             .header(
                 "Server",
-                <HelloHyperServerAdaptor as HyperServerAdaptor<M>>::SERVER_HEADER,
+                PRODUCT_VERSION_HEADER,
             )
             .body(BoxBody::new(Full::new(Bytes::from(self.hello_msg.clone()))))
             .into()

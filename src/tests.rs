@@ -157,10 +157,7 @@ mod tests {
     use url::Url;
 
     use crate::{
-        HttpError, HyperResp,
-        client::{adaptor::HyperClientAdaptor, proc::HyperClientProc},
-        server::{adaptor::HyperServerAdaptor, proc::HyperServerProc},
-        tests::HttpTestSettings,
+        HttpError, HyperResp, PRODUCT_VERSION_HEADER, client::{adaptor::HyperClientAdaptor, proc::HyperClientProc}, server::{adaptor::HyperServerAdaptor, proc::HyperServerProc}, tests::HttpTestSettings
     };
 
     const WAIT_TIME: time::Duration = time::Duration::from_secs(1);
@@ -281,7 +278,7 @@ mod tests {
                 Response::builder()
                     .header(
                         hyper::header::SERVER,
-                        <TestAdaptor as HyperServerAdaptor<M>>::SERVER_HEADER,
+                        PRODUCT_VERSION_HEADER,
                     )
                     .status(StatusCode::OK)
                     .body(BoxBody::new(Full::new(Bytes::from_owner(
@@ -292,7 +289,7 @@ mod tests {
                 Response::builder()
                     .header(
                         hyper::header::SERVER,
-                        <TestAdaptor as HyperServerAdaptor<M>>::SERVER_HEADER,
+                        PRODUCT_VERSION_HEADER,
                     )
                     .status(StatusCode::BAD_REQUEST)
                     .body(BoxBody::new(Full::new(Bytes::from("Bad Request"))))
@@ -398,7 +395,7 @@ mod tests {
                     .uri(socket_url.as_str())
                     .header(
                         hyper::header::USER_AGENT,
-                        <TestAdaptor as HyperClientAdaptor<M>>::USER_AGENT_HEADER,
+                        PRODUCT_VERSION_HEADER,
                     )
                     .body(BoxBody::new(Full::new(Bytes::from(body.into_owned()))))
                     .map_err(|e| {

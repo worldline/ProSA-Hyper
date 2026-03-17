@@ -16,6 +16,7 @@ use prosa::core::service::ServiceError;
 use prosa::core::settings::settings;
 use prosa::inj::adaptor::InjAdaptor;
 use prosa::inj::proc::{InjProc, InjSettings};
+use prosa_hyper::PRODUCT_VERSION_HEADER;
 use prosa_hyper::client::adaptor::HyperClientAdaptor;
 use prosa_hyper::client::proc::{HyperClientProc, HyperClientSettings};
 use prosa_utils::config::tracing::TelemetryFilter;
@@ -67,7 +68,7 @@ where
             .uri(uri.as_str())
             .header(
                 "User-Agent",
-                <HyperDemoAdaptor as HyperClientAdaptor<M>>::USER_AGENT_HEADER,
+                PRODUCT_VERSION_HEADER,
             )
             .body(BoxBody::new(Empty::<Bytes>::new()))
             .map_err(|e| ServiceError::ProtocolError(format!("Failed to build request: {}", e)))

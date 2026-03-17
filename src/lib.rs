@@ -23,6 +23,25 @@ use thiserror::Error;
 
 const H2: &[u8] = b"h2";
 
+/// Product version header value used for `Server` or `User-Agent` header in HTTP requests and responses
+#[cfg(target_family = "unix")]
+pub const PRODUCT_VERSION_HEADER: &str = concat!(
+    env!("CARGO_PKG_NAME"),
+    "/",
+    env!("CARGO_PKG_VERSION"),
+    " (Unix)"
+);
+#[cfg(target_family = "windows")]
+pub const PRODUCT_VERSION_HEADER: &str = concat!(
+    env!("CARGO_PKG_NAME"),
+    "/",
+    env!("CARGO_PKG_VERSION"),
+    " (Windows)"
+);
+#[cfg(all(not(target_family = "unix"), not(target_family = "windows")))]
+pub const PRODUCT_VERSION_HEADER: &str =
+    concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
 /// Global Hyper processor error
 #[derive(Debug, Error)]
 pub enum HyperProcError {

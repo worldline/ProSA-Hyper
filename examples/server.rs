@@ -18,7 +18,7 @@ use prosa::stub::proc::StubSettings;
 use prosa::{core::main::MainProc, stub::proc::StubProc};
 use prosa_hyper::server::adaptor::HyperServerAdaptor;
 use prosa_hyper::server::proc::{HyperServerProc, HyperServerSettings};
-use prosa_hyper::{HttpError, HyperResp};
+use prosa_hyper::{HttpError, HyperResp, PRODUCT_VERSION_HEADER};
 use prosa_utils::config::tracing::TelemetryFilter;
 use prosa_utils::msg::simple_string_tvf::SimpleStringTvf;
 use serde::{Deserialize, Serialize};
@@ -55,7 +55,7 @@ where
             "/" => Response::builder()
                 .header(
                     "Server",
-                    <HyperDemoAdaptor as HyperServerAdaptor<M>>::SERVER_HEADER,
+                    PRODUCT_VERSION_HEADER,
                 )
                 .body(BoxBody::new(Full::new(Bytes::from(format!(
                     "{} - Home of {}",
@@ -77,7 +77,7 @@ where
                 .status(404)
                 .header(
                     "Server",
-                    <HyperDemoAdaptor as HyperServerAdaptor<M>>::SERVER_HEADER,
+                    PRODUCT_VERSION_HEADER,
                 )
                 .body(BoxBody::new(Full::new(Bytes::from("Not Found"))))
                 .into(),
