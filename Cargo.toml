@@ -1,6 +1,6 @@
 [package]
 name = "prosa-hyper"
-version = "0.3.1"
+version = "0.3.0"
 authors = ["Jérémy HERGAULT <jeremy.hergault@worldline.com>", "Anthony THOMAS <anthony.thomas@worldline.com>", "Julien TERUEL <julien.teruel@worldline.com>", "Rene-Louis EYMARD <rene-louis.eymard@worldline.com>"]
 description = "ProSA Hyper processor for HTTP client/server"
 homepage = "https://worldline.com/"
@@ -44,6 +44,7 @@ url = { version = "2", features = ["serde"] }
 opentelemetry = { version = "0.31", features = ["metrics", "trace", "logs"] }
 
 hyper = { version = "1", features = ["full"] }
+http = "1"
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["full"] }
 

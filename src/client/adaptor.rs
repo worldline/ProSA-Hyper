@@ -30,16 +30,6 @@ where
         + prosa::core::msg::Tvf
         + std::default::Default,
 {
-    /// User-Agent header value sent by the client
-    #[cfg(target_family = "unix")]
-    const USER_AGENT_HEADER: &'static str =
-        concat!("ProSA-Hyper/", env!("CARGO_PKG_VERSION"), " (Unix)");
-    #[cfg(target_family = "windows")]
-    const USER_AGENT_HEADER: &'static str =
-        concat!("ProSA-Hyper/", env!("CARGO_PKG_VERSION"), " (Windows)");
-    #[cfg(all(not(target_family = "unix"), not(target_family = "windows")))]
-    const USER_AGENT_HEADER: &'static str = concat!("ProSA-Hyper/", env!("CARGO_PKG_VERSION"));
-
     /// Create a new adaptor
     fn new(proc: &HyperClientProc<M>) -> Result<Self, Box<dyn ProcError + Send + Sync>>
     where

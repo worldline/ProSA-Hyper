@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use http::StatusCode;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{Empty, Full};
 use hyper::service::Service;
@@ -15,7 +16,7 @@ use opentelemetry::metrics::Counter;
 use prosa::core::msg::{InternalMsg, Msg, RequestMsg};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::hyper_version_str;
+use crate::{HttpError, hyper_version_str};
 
 use super::adaptor::HyperServerAdaptor;
 
@@ -68,7 +69,7 @@ where
         proc_queue: mpsc::Sender<RequestMsg<M>>,
         req: Request<hyper::body::Incoming>,
         metric_counter: Counter<u64>,
-    ) -> Result<Response<BoxBody<Bytes, Infallible>>, hyper::Error> {
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError> {
         match adaptor.process_http_request(req).await {
             crate::HyperResp::SrvReq(srv_name, req) => {
                 let resp =
@@ -108,7 +109,7 @@ where
         proc_queue: mpsc::Sender<RequestMsg<M>>,
         service_name: String,
         request: M,
-    ) -> Result<Response<BoxBody<Bytes, Infallible>>, hyper::Error> {
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError> {
         let (resp_tx, resp_rx) = oneshot::channel::<InternalMsg<M>>();
         let _ = proc_queue
             .send(RequestMsg::new(service_name, request, resp_tx))
@@ -118,52 +119,23 @@ where
             Ok(msg) => match msg {
                 InternalMsg::Response(mut msg) => {
                     if let Some(data) = msg.take_data() {
-                        Ok(adaptor.process_srv_response(data))
+                        adaptor.process_srv_response(data)
                     } else {
-                        Ok(Response::builder()
-                            .status(500)
-                            .header("Server", A::SERVER_HEADER)
-                            .body(BoxBody::new(Full::new(Bytes::from("Missing data"))))
-                            .unwrap())
+                        Ok(adaptor
+                            .response_builder(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(BoxBody::new(Empty::<Bytes>::new()))?)
                     }
                 }
-                InternalMsg::Error(err) => match err.get_err() {
-                    prosa::core::service::ServiceError::NoError(_) => Ok(Response::builder()
-                        .status(202)
-                        .header("Server", A::SERVER_HEADER)
-                        .body(BoxBody::new(Empty::<Bytes>::new()))
-                        .unwrap()),
-                    prosa::core::service::ServiceError::UnableToReachService(_) => {
-                        Ok(Response::builder()
-                            .status(503)
-                            .header("Server", A::SERVER_HEADER)
-                            .body(BoxBody::new(Full::new(Bytes::from("Can't reach service"))))
-                            .unwrap())
-                    }
-                    prosa::core::service::ServiceError::Timeout(_, _) => Ok(Response::builder()
-                        .status(504)
-                        .header("Server", A::SERVER_HEADER)
-                        .body(BoxBody::new(Empty::<Bytes>::new()))
-                        .unwrap()),
-                    prosa::core::service::ServiceError::ProtocolError(_) => Ok(Response::builder()
-                        .status(502)
-                        .header("Server", A::SERVER_HEADER)
-                        .body(BoxBody::new(Empty::<Bytes>::new()))
-                        .unwrap()),
-                },
-                _ => Ok(Response::builder()
-                    .status(500)
-                    .header("Server", A::SERVER_HEADER)
-                    .body(BoxBody::new(Full::new(Bytes::from("Server error"))))
-                    .unwrap()),
+                InternalMsg::Error(err) => adaptor.process_srv_error(err),
+                _ => Ok(adaptor
+                    .response_builder(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(BoxBody::new(Empty::<Bytes>::new()))?),
             },
-            Err(_) => Ok(Response::builder()
-                .status(503)
-                .header("Server", A::SERVER_HEADER)
+            Err(_) => Ok(adaptor
+                .response_builder(StatusCode::SERVICE_UNAVAILABLE)
                 .body(BoxBody::new(Full::new(Bytes::from(
                     "Can't handle your request for now",
-                ))))
-                .unwrap()),
+                ))))?),
         }
     }
 }
@@ -181,7 +153,7 @@ where
         + std::marker::Sync,
 {
     type Response = Response<BoxBody<Bytes, Infallible>>;
-    type Error = hyper::Error;
+    type Error = HttpError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&self, req: Request<hyper::body::Incoming>) -> Self::Future {

@@ -157,7 +157,7 @@ mod tests {
     use url::Url;
 
     use crate::{
-        HyperResp,
+        HttpError, HyperResp, PRODUCT_VERSION_HEADER,
         client::{adaptor::HyperClientAdaptor, proc::HyperClientProc},
         server::{adaptor::HyperServerAdaptor, proc::HyperServerProc},
         tests::HttpTestSettings,
@@ -271,29 +271,26 @@ mod tests {
         fn process_srv_response(
             &self,
             resp: M,
-        ) -> hyper::Response<
-            http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>,
+        ) -> Result<
+            hyper::Response<
+                http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>,
+            >,
+            HttpError,
         > {
             if let Ok(content) = resp.get_string(1) {
                 Response::builder()
-                    .header(
-                        hyper::header::SERVER,
-                        <TestAdaptor as HyperServerAdaptor<M>>::SERVER_HEADER,
-                    )
+                    .header(hyper::header::SERVER, PRODUCT_VERSION_HEADER)
                     .status(StatusCode::OK)
                     .body(BoxBody::new(Full::new(Bytes::from_owner(
                         content.into_owned(),
                     ))))
-                    .unwrap()
+                    .map_err(|e| e.into())
             } else {
                 Response::builder()
-                    .header(
-                        hyper::header::SERVER,
-                        <TestAdaptor as HyperServerAdaptor<M>>::SERVER_HEADER,
-                    )
+                    .header(hyper::header::SERVER, PRODUCT_VERSION_HEADER)
                     .status(StatusCode::BAD_REQUEST)
                     .body(BoxBody::new(Full::new(Bytes::from("Bad Request"))))
-                    .unwrap()
+                    .map_err(|e| e.into())
             }
         }
     }
@@ -393,10 +390,7 @@ mod tests {
                 Ok(body) => Request::builder()
                     .method(Method::POST)
                     .uri(socket_url.as_str())
-                    .header(
-                        hyper::header::USER_AGENT,
-                        <TestAdaptor as HyperClientAdaptor<M>>::USER_AGENT_HEADER,
-                    )
+                    .header(hyper::header::USER_AGENT, PRODUCT_VERSION_HEADER)
                     .body(BoxBody::new(Full::new(Bytes::from(body.into_owned()))))
                     .map_err(|e| {
                         ServiceError::ProtocolError(format!("Failed to build request: {}", e))

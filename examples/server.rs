@@ -16,9 +16,9 @@ use prosa::core::settings::settings;
 use prosa::stub::adaptor::StubParotAdaptor;
 use prosa::stub::proc::StubSettings;
 use prosa::{core::main::MainProc, stub::proc::StubProc};
-use prosa_hyper::HyperResp;
 use prosa_hyper::server::adaptor::HyperServerAdaptor;
 use prosa_hyper::server::proc::{HyperServerProc, HyperServerSettings};
+use prosa_hyper::{HttpError, HyperResp, PRODUCT_VERSION_HEADER};
 use prosa_utils::config::tracing::TelemetryFilter;
 use prosa_utils::msg::simple_string_tvf::SimpleStringTvf;
 use serde::{Deserialize, Serialize};
@@ -52,43 +52,36 @@ where
         req: Request<hyper::body::Incoming>,
     ) -> crate::HyperResp<M> {
         match req.uri().path() {
-            "/" => HyperResp::HttpResp(
-                Response::builder()
-                    .header(
-                        "Server",
-                        <HyperDemoAdaptor as HyperServerAdaptor<M>>::SERVER_HEADER,
-                    )
-                    .body(BoxBody::new(Full::new(Bytes::from(format!(
-                        "{} - Home of {}",
-                        if req.version() == hyper::Version::HTTP_2 {
-                            "H2"
-                        } else {
-                            "HTTP/1.1"
-                        },
-                        self.prosa_name,
-                    )))))
-                    .unwrap(),
-            ),
+            "/" => Response::builder()
+                .header("Server", PRODUCT_VERSION_HEADER)
+                .body(BoxBody::new(Full::new(Bytes::from(format!(
+                    "{} - Home of {}",
+                    if req.version() == hyper::Version::HTTP_2 {
+                        "H2"
+                    } else {
+                        "HTTP/1.1"
+                    },
+                    self.prosa_name,
+                )))))
+                .into(),
             "/test" => {
                 let mut tvf_req = M::default();
                 tvf_req.put_string(1, req.method().to_string());
                 tvf_req.put_string(2, "/test");
                 HyperResp::SrvReq(String::from("SRV_TEST"), tvf_req)
             }
-            _ => HyperResp::HttpResp(
-                Response::builder()
-                    .status(404)
-                    .header(
-                        "Server",
-                        <HyperDemoAdaptor as HyperServerAdaptor<M>>::SERVER_HEADER,
-                    )
-                    .body(BoxBody::new(Full::new(Bytes::from("Not Found"))))
-                    .unwrap(),
-            ),
+            _ => Response::builder()
+                .status(404)
+                .header("Server", PRODUCT_VERSION_HEADER)
+                .body(BoxBody::new(Full::new(Bytes::from("Not Found"))))
+                .into(),
         }
     }
 
-    fn process_srv_response(&self, resp: M) -> Response<BoxBody<Bytes, Infallible>> {
+    fn process_srv_response(
+        &self,
+        resp: M,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError> {
         let body = resp
             .get_string(10)
             .unwrap_or(Cow::Owned(String::from("empty body")));
@@ -96,7 +89,7 @@ where
             .body(BoxBody::new(Full::new(Bytes::from(format!(
                 "Body: {body}\nTvfResp: {resp:?}"
             )))))
-            .unwrap()
+            .map_err(|e| e.into())
     }
 }
 

@@ -23,6 +23,25 @@ use thiserror::Error;
 
 const H2: &[u8] = b"h2";
 
+/// Product version header value used for `Server` or `User-Agent` header in HTTP requests and responses
+#[cfg(target_family = "unix")]
+pub const PRODUCT_VERSION_HEADER: &str = concat!(
+    env!("CARGO_PKG_NAME"),
+    "/",
+    env!("CARGO_PKG_VERSION"),
+    " (Unix)"
+);
+#[cfg(target_family = "windows")]
+pub const PRODUCT_VERSION_HEADER: &str = concat!(
+    env!("CARGO_PKG_NAME"),
+    "/",
+    env!("CARGO_PKG_VERSION"),
+    " (Windows)"
+);
+#[cfg(all(not(target_family = "unix"), not(target_family = "windows")))]
+pub const PRODUCT_VERSION_HEADER: &str =
+    concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
 /// Global Hyper processor error
 #[derive(Debug, Error)]
 pub enum HyperProcError {
@@ -70,6 +89,17 @@ where
     }
 }
 
+/// Error related to an HTTP message or Hyper error
+#[derive(Debug, Error)]
+pub enum HttpError {
+    /// Hyper Error
+    #[error("Hyper error: `{0}`")]
+    Hyper(#[from] hyper::Error),
+    /// HTTP Error
+    #[error("HTTP error: `{0}`")]
+    Http(#[from] http::Error),
+}
+
 /// Method to get a string version of the Hyper Version object
 fn hyper_version_str(version: Version) -> &'static str {
     match version {
@@ -88,7 +118,34 @@ pub enum HyperResp<M> {
     /// Make a direct HTTP response
     HttpResp(Response<BoxBody<Bytes, Infallible>>),
     /// Response with an HTTP error
-    HttpErr(hyper::Error),
+    HttpErr(HttpError),
+}
+
+impl<M> From<HttpError> for HyperResp<M> {
+    fn from(err: HttpError) -> Self {
+        Self::HttpErr(err)
+    }
+}
+
+impl<M> From<hyper::Error> for HyperResp<M> {
+    fn from(err: hyper::Error) -> Self {
+        Self::HttpErr(HttpError::Hyper(err))
+    }
+}
+
+impl<M> From<http::Error> for HyperResp<M> {
+    fn from(err: http::Error) -> Self {
+        Self::HttpErr(HttpError::Http(err))
+    }
+}
+
+impl<M> From<Result<Response<BoxBody<Bytes, Infallible>>, http::Error>> for HyperResp<M> {
+    fn from(res: Result<Response<BoxBody<Bytes, Infallible>>, http::Error>) -> Self {
+        match res {
+            Ok(response) => Self::HttpResp(response),
+            Err(err) => Self::HttpErr(HttpError::Http(err)),
+        }
+    }
 }
 
 #[cfg(feature = "server")]
