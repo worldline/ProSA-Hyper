@@ -54,36 +54,61 @@ where
     fn process_http_request(
         &self,
         req: Request<hyper::body::Incoming>,
-    ) -> impl std::future::Future<Output = HyperResp<M>> + Send;
+    ) -> impl std::future::Future<Output = HyperResp<Self, M>> + Send
+    where
+        Self: Sized + Send + Sync + 'static,
+        M: 'static
+            + Send
+            + Sync
+            + Sized
+            + Clone
+            + std::fmt::Debug
+            + prosa::core::msg::Tvf
+            + Default;
+}
 
-    /// Method to process input response to respond with an Hyper HTTP response.
-    fn process_srv_response(
-        &self,
-        resp: M,
-    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError>;
-
-    /// Method to process input service error to respond with an Hyper HTTP response.
-    fn process_srv_error(
-        &self,
-        err: ErrorMsg<M>,
-    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError> {
-        match err.get_err() {
-            prosa::core::service::ServiceError::NoError(_) => self
-                .response_builder(StatusCode::ACCEPTED)
-                .body(BoxBody::new(Empty::<Bytes>::new()))
-                .map_err(|e| e.into()),
-            prosa::core::service::ServiceError::UnableToReachService(_) => self
-                .response_builder(StatusCode::SERVICE_UNAVAILABLE)
+/// Convert a service error message into a default HTTP response.
+///
+/// This provides a default mapping from [`prosa::core::service::ServiceError`] variants to HTTP status codes:
+/// - `NoError` -> `202 Accepted`
+/// - `UnableToReachService` -> `503 Service Unavailable`
+/// - `Timeout` -> `504 Gateway Timeout`
+/// - `ProtocolError` -> `502 Bad Gateway`
+///
+/// The `response_builder` parameter allows customizing the response headers (e.g., adding a `Server` header).
+pub fn default_srv_error_response<M, F>(
+    err: &ErrorMsg<M>,
+    response_builder: F,
+) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError>
+where
+    M: 'static
+        + std::marker::Send
+        + std::marker::Sync
+        + std::marker::Sized
+        + std::clone::Clone
+        + std::fmt::Debug
+        + prosa::core::msg::Tvf
+        + std::default::Default,
+    F: Fn(StatusCode) -> response::Builder,
+{
+    match err.get_err() {
+        prosa::core::service::ServiceError::NoError(_) => response_builder(StatusCode::ACCEPTED)
+            .body(BoxBody::new(Empty::<Bytes>::new()))
+            .map_err(|e| e.into()),
+        prosa::core::service::ServiceError::UnableToReachService(_) => {
+            response_builder(StatusCode::SERVICE_UNAVAILABLE)
                 .body(BoxBody::new(Full::new(Bytes::from("Can't reach service"))))
-                .map_err(|e| e.into()),
-            prosa::core::service::ServiceError::Timeout(_, _) => self
-                .response_builder(StatusCode::GATEWAY_TIMEOUT)
+                .map_err(|e| e.into())
+        }
+        prosa::core::service::ServiceError::Timeout(_, _) => {
+            response_builder(StatusCode::GATEWAY_TIMEOUT)
                 .body(BoxBody::new(Empty::<Bytes>::new()))
-                .map_err(|e| e.into()),
-            prosa::core::service::ServiceError::ProtocolError(_) => self
-                .response_builder(StatusCode::BAD_GATEWAY)
+                .map_err(|e| e.into())
+        }
+        prosa::core::service::ServiceError::ProtocolError(_) => {
+            response_builder(StatusCode::BAD_GATEWAY)
                 .body(BoxBody::new(Empty::<Bytes>::new()))
-                .map_err(|e| e.into()),
+                .map_err(|e| e.into())
         }
     }
 }
@@ -111,18 +136,14 @@ where
         })
     }
 
-    async fn process_http_request(&self, _req: Request<hyper::body::Incoming>) -> HyperResp<M> {
+    async fn process_http_request(
+        &self,
+        _req: Request<hyper::body::Incoming>,
+    ) -> HyperResp<Self, M> {
         Response::builder()
             .status(200)
             .header("Server", PRODUCT_VERSION_HEADER)
             .body(BoxBody::new(Full::new(Bytes::from(self.hello_msg.clone()))))
             .into()
-    }
-
-    fn process_srv_response(
-        &self,
-        _resp: M,
-    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError> {
-        panic!("No message should be send to an external service")
     }
 }

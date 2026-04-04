@@ -41,7 +41,7 @@ where
 
 impl<A, M> HyperService<A, M>
 where
-    A: 'static + HyperServerAdaptor<M> + Clone,
+    A: 'static + HyperServerAdaptor<M> + Clone + std::marker::Sync + std::marker::Send,
     M: 'static
         + std::marker::Send
         + std::marker::Sync
@@ -71,10 +71,11 @@ where
         metric_counter: Counter<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError> {
         match adaptor.process_http_request(req).await {
-            crate::HyperResp::SrvReq(srv_name, req) => {
-                let resp =
-                    HyperService::<A, M>::wait_intern_resp(adaptor, proc_queue, srv_name, req)
-                        .await;
+            crate::HyperResp::SrvReq(srv_name, req, handler) => {
+                let resp = HyperService::<A, M>::wait_intern_resp(
+                    adaptor, proc_queue, srv_name, req, handler,
+                )
+                .await;
                 if let Ok(ref res) = resp {
                     metric_counter.add(
                         1,
@@ -109,6 +110,7 @@ where
         proc_queue: mpsc::Sender<RequestMsg<M>>,
         service_name: String,
         request: M,
+        handler: crate::SrvRespHandler<A, M>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError> {
         let (resp_tx, resp_rx) = oneshot::channel::<InternalMsg<M>>();
         let _ = proc_queue
@@ -119,14 +121,14 @@ where
             Ok(msg) => match msg {
                 InternalMsg::Response(mut msg) => {
                     if let Some(data) = msg.take_data() {
-                        adaptor.process_srv_response(data)
+                        handler(&adaptor, Ok(data))
                     } else {
                         Ok(adaptor
                             .response_builder(StatusCode::INTERNAL_SERVER_ERROR)
                             .body(BoxBody::new(Empty::<Bytes>::new()))?)
                     }
                 }
-                InternalMsg::Error(err) => adaptor.process_srv_error(err),
+                InternalMsg::Error(err) => handler(&adaptor, Err(err)),
                 _ => Ok(adaptor
                     .response_builder(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(BoxBody::new(Empty::<Bytes>::new()))?),
