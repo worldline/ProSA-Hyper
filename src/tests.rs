@@ -278,7 +278,7 @@ mod tests {
                     Ok(resp) => {
                         if let Ok(content) = resp.get_string(1) {
                             <TestAdaptor as HyperServerAdaptor<M>>::response_builder(
-                                &adaptor,
+                                adaptor,
                                 StatusCode::OK,
                             )
                             .body(BoxBody::new(Full::new(Bytes::from_owner(
@@ -287,7 +287,7 @@ mod tests {
                             .map_err(|e| e.into())
                         } else {
                             <TestAdaptor as HyperServerAdaptor<M>>::response_builder(
-                                &adaptor,
+                                adaptor,
                                 StatusCode::BAD_REQUEST,
                             )
                             .body(BoxBody::new(Full::new(Bytes::from("Bad Request"))))
@@ -295,7 +295,7 @@ mod tests {
                         }
                     }
                     Err(err) => default_srv_error_response(&err, |s| {
-                        <TestAdaptor as HyperServerAdaptor<M>>::response_builder(&adaptor, s)
+                        <TestAdaptor as HyperServerAdaptor<M>>::response_builder(adaptor, s)
                     }),
                 }),
             )

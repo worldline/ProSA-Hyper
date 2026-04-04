@@ -77,7 +77,7 @@ where
                                 .get_string(10)
                                 .unwrap_or(Cow::Owned(String::from("empty body")));
                             <HyperDemoAdaptor as HyperServerAdaptor<M>>::response_builder(
-                                &adaptor,
+                                adaptor,
                                 StatusCode::OK,
                             )
                             .body(BoxBody::new(Full::new(Bytes::from(format!(
@@ -87,7 +87,7 @@ where
                         }
                         Err(err) => default_srv_error_response(&err, |s| {
                             <HyperDemoAdaptor as HyperServerAdaptor<M>>::response_builder(
-                                &adaptor, s,
+                                adaptor, s,
                             )
                         }),
                     }),
