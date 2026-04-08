@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::convert::Infallible;
+
 use std::env;
 
 use bytes::Bytes;
@@ -7,7 +7,7 @@ use clap::{ArgAction, Command, arg};
 use config::Config;
 use http_body_util::Full;
 use http_body_util::combinators::BoxBody;
-use hyper::{Request, Response};
+use hyper::{Request, Response, StatusCode};
 use prosa::core::adaptor::Adaptor;
 use prosa::core::error::ProcError;
 use prosa::core::main::MainRunnable as _;
@@ -16,9 +16,9 @@ use prosa::core::settings::settings;
 use prosa::stub::adaptor::StubParotAdaptor;
 use prosa::stub::proc::StubSettings;
 use prosa::{core::main::MainProc, stub::proc::StubProc};
-use prosa_hyper::server::adaptor::HyperServerAdaptor;
+use prosa_hyper::server::adaptor::{HyperServerAdaptor, default_srv_error_response};
 use prosa_hyper::server::proc::{HyperServerProc, HyperServerSettings};
-use prosa_hyper::{HttpError, HyperResp, PRODUCT_VERSION_HEADER};
+use prosa_hyper::{HyperResp, PRODUCT_VERSION_HEADER};
 use prosa_utils::config::tracing::TelemetryFilter;
 use prosa_utils::msg::simple_string_tvf::SimpleStringTvf;
 use serde::{Deserialize, Serialize};
@@ -50,7 +50,7 @@ where
     async fn process_http_request(
         &self,
         req: Request<hyper::body::Incoming>,
-    ) -> crate::HyperResp<M> {
+    ) -> crate::HyperResp<Self, M> {
         match req.uri().path() {
             "/" => Response::builder()
                 .header("Server", PRODUCT_VERSION_HEADER)
@@ -68,7 +68,30 @@ where
                 let mut tvf_req = M::default();
                 tvf_req.put_string(1, req.method().to_string());
                 tvf_req.put_string(2, "/test");
-                HyperResp::SrvReq(String::from("SRV_TEST"), tvf_req)
+                HyperResp::SrvReq(
+                    String::from("SRV_TEST"),
+                    tvf_req,
+                    Box::new(move |adaptor, result| match result {
+                        Ok(resp) => {
+                            let body = resp
+                                .get_string(10)
+                                .unwrap_or(Cow::Owned(String::from("empty body")));
+                            <HyperDemoAdaptor as HyperServerAdaptor<M>>::response_builder(
+                                adaptor,
+                                StatusCode::OK,
+                            )
+                            .body(BoxBody::new(Full::new(Bytes::from(format!(
+                                "Body: {body}\nTvfResp: {resp:?}"
+                            )))))
+                            .map_err(|e| e.into())
+                        }
+                        Err(err) => default_srv_error_response(&err, |s| {
+                            <HyperDemoAdaptor as HyperServerAdaptor<M>>::response_builder(
+                                adaptor, s,
+                            )
+                        }),
+                    }),
+                )
             }
             _ => Response::builder()
                 .status(404)
@@ -76,20 +99,6 @@ where
                 .body(BoxBody::new(Full::new(Bytes::from("Not Found"))))
                 .into(),
         }
-    }
-
-    fn process_srv_response(
-        &self,
-        resp: M,
-    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError> {
-        let body = resp
-            .get_string(10)
-            .unwrap_or(Cow::Owned(String::from("empty body")));
-        Response::builder()
-            .body(BoxBody::new(Full::new(Bytes::from(format!(
-                "Body: {body}\nTvfResp: {resp:?}"
-            )))))
-            .map_err(|e| e.into())
     }
 }
 

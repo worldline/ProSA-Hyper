@@ -157,9 +157,12 @@ mod tests {
     use url::Url;
 
     use crate::{
-        HttpError, HyperResp, PRODUCT_VERSION_HEADER,
+        HyperResp, PRODUCT_VERSION_HEADER,
         client::{adaptor::HyperClientAdaptor, proc::HyperClientProc},
-        server::{adaptor::HyperServerAdaptor, proc::HyperServerProc},
+        server::{
+            adaptor::{HyperServerAdaptor, default_srv_error_response},
+            proc::HyperServerProc,
+        },
         tests::HttpTestSettings,
     };
 
@@ -248,7 +251,10 @@ mod tests {
             Ok(TestAdaptor { test_type })
         }
 
-        async fn process_http_request(&self, req: Request<hyper::body::Incoming>) -> HyperResp<M> {
+        async fn process_http_request(
+            &self,
+            req: Request<hyper::body::Incoming>,
+        ) -> HyperResp<Self, M> {
             let mut srv_req = M::default();
 
             if let Some(user_agent) = req
@@ -265,33 +271,34 @@ mod tests {
                 srv_req.put_string(1, body_str);
             }
 
-            HyperResp::SrvReq("STUB_HTTP_SRV".into(), srv_req)
-        }
-
-        fn process_srv_response(
-            &self,
-            resp: M,
-        ) -> Result<
-            hyper::Response<
-                http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>,
-            >,
-            HttpError,
-        > {
-            if let Ok(content) = resp.get_string(1) {
-                Response::builder()
-                    .header(hyper::header::SERVER, PRODUCT_VERSION_HEADER)
-                    .status(StatusCode::OK)
-                    .body(BoxBody::new(Full::new(Bytes::from_owner(
-                        content.into_owned(),
-                    ))))
-                    .map_err(|e| e.into())
-            } else {
-                Response::builder()
-                    .header(hyper::header::SERVER, PRODUCT_VERSION_HEADER)
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(BoxBody::new(Full::new(Bytes::from("Bad Request"))))
-                    .map_err(|e| e.into())
-            }
+            HyperResp::SrvReq(
+                "STUB_HTTP_SRV".into(),
+                srv_req,
+                Box::new(move |adaptor, result| match result {
+                    Ok(resp) => {
+                        if let Ok(content) = resp.get_string(1) {
+                            <TestAdaptor as HyperServerAdaptor<M>>::response_builder(
+                                adaptor,
+                                StatusCode::OK,
+                            )
+                            .body(BoxBody::new(Full::new(Bytes::from_owner(
+                                content.into_owned(),
+                            ))))
+                            .map_err(|e| e.into())
+                        } else {
+                            <TestAdaptor as HyperServerAdaptor<M>>::response_builder(
+                                adaptor,
+                                StatusCode::BAD_REQUEST,
+                            )
+                            .body(BoxBody::new(Full::new(Bytes::from("Bad Request"))))
+                            .map_err(|e| e.into())
+                        }
+                    }
+                    Err(err) => default_srv_error_response(&err, |s| {
+                        <TestAdaptor as HyperServerAdaptor<M>>::response_builder(adaptor, s)
+                    }),
+                }),
+            )
         }
     }
 

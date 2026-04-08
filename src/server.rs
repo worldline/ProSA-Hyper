@@ -33,7 +33,7 @@ mod tests {
     use url::Url;
 
     use crate::{
-        HttpError, HyperResp,
+        HyperResp,
         server::{adaptor::HyperServerAdaptor, proc::HyperServerProc},
         tests::HttpTestSettings,
     };
@@ -65,7 +65,10 @@ mod tests {
             Ok(ServerTestAdaptor {})
         }
 
-        async fn process_http_request(&self, req: Request<hyper::body::Incoming>) -> HyperResp<M> {
+        async fn process_http_request(
+            &self,
+            req: Request<hyper::body::Incoming>,
+        ) -> HyperResp<Self, M> {
             let resp_msg = if req.version() == hyper::Version::HTTP_2 {
                 "Hello, H2 world"
             } else {
@@ -74,18 +77,6 @@ mod tests {
             <ServerTestAdaptor as HyperServerAdaptor<M>>::response_builder(self, StatusCode::OK)
                 .body(BoxBody::new(Full::new(Bytes::from(resp_msg))))
                 .into()
-        }
-
-        fn process_srv_response(
-            &self,
-            _resp: M,
-        ) -> Result<
-            hyper::Response<
-                http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>,
-            >,
-            HttpError,
-        > {
-            unimplemented!()
         }
     }
 

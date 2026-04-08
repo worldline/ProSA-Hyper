@@ -17,7 +17,7 @@ use http_body_util::combinators::BoxBody;
 use hyper::{Response, Version};
 use prosa::core::{
     error::{BusError, ProcError},
-    msg::InternalMsg,
+    msg::{ErrorMsg, InternalMsg},
 };
 use thiserror::Error;
 
@@ -110,36 +110,128 @@ fn hyper_version_str(version: Version) -> &'static str {
     }
 }
 
+/// Type alias for the closure that processes an internal service response or error.
+///
+/// Receives `Ok(M)` on success or `Err(ErrorMsg<M>)` on service error.
+/// Returns an HTTP response or an HTTP error.
+pub type SrvRespHandler<A, M> = Box<
+    dyn FnOnce(
+            &A,
+            Result<M, ErrorMsg<M>>,
+        ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError>
+        + Send,
+>;
+
 /// Enum to define all type of response to request it can be made
-#[derive(Debug)]
-pub enum HyperResp<M> {
-    /// Make an internal service request to have a response
-    SrvReq(String, M),
+pub enum HyperResp<A, M>
+where
+    A: server::adaptor::HyperServerAdaptor<M>,
+    M: 'static
+        + std::marker::Send
+        + std::marker::Sync
+        + std::marker::Sized
+        + std::clone::Clone
+        + std::fmt::Debug
+        + prosa::core::msg::Tvf
+        + std::default::Default,
+{
+    /// Make an internal service request and process the response with the provided handler
+    SrvReq(String, M, SrvRespHandler<A, M>),
     /// Make a direct HTTP response
     HttpResp(Response<BoxBody<Bytes, Infallible>>),
     /// Response with an HTTP error
     HttpErr(HttpError),
 }
 
-impl<M> From<HttpError> for HyperResp<M> {
+impl<A, M> std::fmt::Debug for HyperResp<A, M>
+where
+    A: server::adaptor::HyperServerAdaptor<M>,
+    M: 'static
+        + std::marker::Send
+        + std::marker::Sync
+        + std::marker::Sized
+        + std::clone::Clone
+        + std::fmt::Debug
+        + prosa::core::msg::Tvf
+        + std::default::Default,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HyperResp::SrvReq(name, msg, _) => f
+                .debug_tuple("SrvReq")
+                .field(name)
+                .field(msg)
+                .field(&"<handler>")
+                .finish(),
+            HyperResp::HttpResp(resp) => f.debug_tuple("HttpResp").field(resp).finish(),
+            HyperResp::HttpErr(err) => f.debug_tuple("HttpErr").field(err).finish(),
+        }
+    }
+}
+
+impl<A, M> From<HttpError> for HyperResp<A, M>
+where
+    A: server::adaptor::HyperServerAdaptor<M>,
+    M: 'static
+        + std::marker::Send
+        + std::marker::Sync
+        + std::marker::Sized
+        + std::clone::Clone
+        + std::fmt::Debug
+        + prosa::core::msg::Tvf
+        + std::default::Default,
+{
     fn from(err: HttpError) -> Self {
         Self::HttpErr(err)
     }
 }
 
-impl<M> From<hyper::Error> for HyperResp<M> {
+impl<A, M> From<hyper::Error> for HyperResp<A, M>
+where
+    A: server::adaptor::HyperServerAdaptor<M>,
+    M: 'static
+        + std::marker::Send
+        + std::marker::Sync
+        + std::marker::Sized
+        + std::clone::Clone
+        + std::fmt::Debug
+        + prosa::core::msg::Tvf
+        + std::default::Default,
+{
     fn from(err: hyper::Error) -> Self {
         Self::HttpErr(HttpError::Hyper(err))
     }
 }
 
-impl<M> From<http::Error> for HyperResp<M> {
+impl<A, M> From<http::Error> for HyperResp<A, M>
+where
+    A: server::adaptor::HyperServerAdaptor<M>,
+    M: 'static
+        + std::marker::Send
+        + std::marker::Sync
+        + std::marker::Sized
+        + std::clone::Clone
+        + std::fmt::Debug
+        + prosa::core::msg::Tvf
+        + std::default::Default,
+{
     fn from(err: http::Error) -> Self {
         Self::HttpErr(HttpError::Http(err))
     }
 }
 
-impl<M> From<Result<Response<BoxBody<Bytes, Infallible>>, http::Error>> for HyperResp<M> {
+impl<A, M> From<Result<Response<BoxBody<Bytes, Infallible>>, http::Error>> for HyperResp<A, M>
+where
+    A: server::adaptor::HyperServerAdaptor<M>,
+    M: 'static
+        + std::marker::Send
+        + std::marker::Sync
+        + std::marker::Sized
+        + std::clone::Clone
+        + std::fmt::Debug
+        + prosa::core::msg::Tvf
+        + std::default::Default,
+{
     fn from(res: Result<Response<BoxBody<Bytes, Infallible>>, http::Error>) -> Self {
         match res {
             Ok(response) => Self::HttpResp(response),
