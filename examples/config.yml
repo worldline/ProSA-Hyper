@@ -20,24 +20,18 @@ observability:
   level: DEBUG
   metrics:
     #otlp: # Opentelemetry protocol
-    #  endpoint: "http://localhost:4137"
-    #  timeout_sec: 3
-    #  protocol: Grpc
+    #  endpoint: "grpc://localhost:4137"
     prometheus:
       endpoint: "0.0.0.0:9090"
     stdout:
       level: debug
   traces:
     #otlp: # Opentelemetry protocol
-    #  endpoint: "http://localhost:4137"
-    #  timeout_sec: 3
-    #  protocol: Grpc
+    #  endpoint: "grpc://localhost:4137"
     stdout:
       level: debug
   logs:
     #otlp: # Opentelemetry protocol
-    #  endpoint: "http://localhost:4137"
-    #  timeout_sec: 3
-    #  protocol: Grpc
+    #  endpoint: "grpc://localhost:4137"
     stdout:
       level: debug

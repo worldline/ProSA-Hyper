@@ -26,7 +26,7 @@ mod tests {
     use std::{
         env,
         fs::{self, File},
-        io::Read as _,
+        io::{self, Read as _},
         time::Duration,
     };
     use tokio::time;
@@ -80,7 +80,11 @@ mod tests {
         }
     }
 
-    async fn run_test(settings: HttpTestSettings, certificate: Option<Certificate>, http2: bool) {
+    async fn run_test(
+        settings: HttpTestSettings,
+        certificate: Option<Certificate>,
+        http2: bool,
+    ) -> io::Result<()> {
         let url = settings.server.listener.url.clone();
 
         // Create bus and main processor
@@ -106,12 +110,14 @@ mod tests {
             .timeout(Duration::from_secs(WAIT_TIME.as_secs()))
             .use_rustls_tls();
         if let Some(cert) = certificate {
-            client_builder = client_builder.add_root_certificate(cert);
+            client_builder = client_builder.tls_certs_only(vec![cert]);
         }
         if http2 {
             client_builder = client_builder.http2_prior_knowledge();
         }
-        let client = client_builder.build().unwrap();
+        let client = client_builder
+            .build()
+            .expect("reqwest client should be valid");
         for _i in 0..20 {
             let resp = client
                 .get(url.clone())
@@ -119,29 +125,36 @@ mod tests {
                 .await
                 .expect("Failed to send request");
             assert_eq!(resp.status(), StatusCode::OK);
-            let server_header = resp.headers().get(hyper::header::SERVER).unwrap();
-            assert!(server_header.to_str().unwrap().starts_with(concat!(
-                env!("CARGO_PKG_NAME"),
-                "/",
-                env!("CARGO_PKG_VERSION")
-            )));
+            assert!(resp.headers().get(hyper::header::SERVER).is_some_and(|h| {
+                h.to_str().is_ok_and(|s| {
+                    s.starts_with(concat!(
+                        env!("CARGO_PKG_NAME"),
+                        "/",
+                        env!("CARGO_PKG_VERSION")
+                    ))
+                })
+            }));
         }
 
         bus.stop("ProSA HTTP client server unit test end".into())
             .await
-            .unwrap();
+            .map_err(io::Error::other)?;
 
         // Wait on main task to end
         main_task.await;
+        Ok(())
     }
 
     #[tokio::test]
     async fn http_client_server() {
-        let test_settings =
-            HttpTestSettings::new(Url::parse("http://localhost:48180").unwrap(), None, None);
+        let test_settings = HttpTestSettings::new(
+            Url::parse("http://localhost:48180").expect("HTTP client/server URL should be valid"),
+            None,
+            None,
+        );
 
         // Run a ProSA to test
-        run_test(test_settings, None, false).await;
+        assert!(run_test(test_settings, None, false).await.is_ok());
     }
 
     #[tokio::test]
@@ -150,37 +163,57 @@ mod tests {
         let prosa_temp_dir = env::temp_dir().join(PROSA_HTTPS_TEST_DIR_NAME);
 
         let _ = fs::remove_dir_all(&prosa_temp_dir);
-        fs::create_dir_all(&prosa_temp_dir).unwrap();
+        fs::create_dir_all(&prosa_temp_dir)
+            .expect("Can't create ProSA temporary directory for HTTPS");
 
         let key_path = prosa_temp_dir.join("prosa_server_https.key");
         let cert_path = prosa_temp_dir.join("prosa_server_https.pem");
+        let cert_path_str = cert_path
+            .as_os_str()
+            .to_str()
+            .expect("Cert path should be a valid String");
         let server_ssl_config = HttpTestSettings::create_server_cert(
-            key_path.as_os_str().to_str().unwrap().into(),
-            cert_path.as_os_str().to_str().unwrap().into(),
+            key_path
+                .as_os_str()
+                .to_str()
+                .expect("Key path should be a valid String")
+                .into(),
+            cert_path_str.into(),
         )
-        .unwrap();
+        .expect("Server certificate should be created");
 
         let mut buf = Vec::new();
-        File::open(cert_path.as_os_str().to_str().unwrap())
-            .unwrap()
+        File::open(cert_path_str)
+            .expect("Cert file should exist")
             .read_to_end(&mut buf)
-            .unwrap();
-        let client_cert = reqwest::Certificate::from_pem(&buf).unwrap();
+            .expect("Cert file should be read");
+        let client_cert =
+            reqwest::Certificate::from_pem(&buf).expect("Certificate should be valid for reqwest");
 
         let client_ssl_store = Store::File {
-            path: format!("{}/", prosa_temp_dir.as_os_str().to_str().unwrap()),
+            path: format!(
+                "{}/",
+                prosa_temp_dir
+                    .as_os_str()
+                    .to_str()
+                    .expect("ProSA temp dir should be a valid String")
+            ),
         };
         let mut client_ssl_config = SslConfig::default();
         client_ssl_config.set_store(client_ssl_store);
 
         let test_settings = HttpTestSettings::new(
-            Url::parse("https://localhost:48543").unwrap(),
+            Url::parse("https://localhost:48543").expect("HTTPS client/server URL should be valid"),
             Some(server_ssl_config),
             Some(client_ssl_config),
         );
 
         // Run a ProSA to test
-        run_test(test_settings, Some(client_cert), false).await;
+        assert!(
+            run_test(test_settings, Some(client_cert), false)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -189,39 +222,58 @@ mod tests {
         let prosa_temp_dir = env::temp_dir().join(PROSA_H2_TEST_DIR_NAME);
 
         let _ = fs::remove_dir_all(&prosa_temp_dir);
-        fs::create_dir_all(&prosa_temp_dir).unwrap();
+        fs::create_dir_all(&prosa_temp_dir).expect("Can't create ProSA temporary directory for H2");
 
         let key_path = prosa_temp_dir.join("prosa_server_h2.key");
         let cert_path = prosa_temp_dir.join("prosa_server_h2.pem");
+        let cert_path_str = cert_path
+            .as_os_str()
+            .to_str()
+            .expect("Cert path should be a valid String");
         let mut server_ssl_config = HttpTestSettings::create_server_cert(
-            key_path.as_os_str().to_str().unwrap().into(),
-            cert_path.as_os_str().to_str().unwrap().into(),
+            key_path
+                .as_os_str()
+                .to_str()
+                .expect("Key path should be a valid String")
+                .into(),
+            cert_path_str.into(),
         )
-        .unwrap();
+        .expect("Server certificate should be created");
         // Need to set the ALPN for server because of inline configuration @see TargetSetting::new
         server_ssl_config.set_alpn(vec!["h2".into()]);
 
         let mut buf = Vec::new();
-        File::open(cert_path.as_os_str().to_str().unwrap())
-            .unwrap()
+        File::open(cert_path_str)
+            .expect("Cert file should exist")
             .read_to_end(&mut buf)
-            .unwrap();
-        let client_cert = reqwest::Certificate::from_pem(&buf).unwrap();
+            .expect("Cert file should be read");
+        let client_cert =
+            reqwest::Certificate::from_pem(&buf).expect("Certificate should be valid for reqwest");
 
         let client_ssl_store = Store::File {
-            path: format!("{}/", prosa_temp_dir.as_os_str().to_str().unwrap()),
+            path: format!(
+                "{}/",
+                prosa_temp_dir
+                    .as_os_str()
+                    .to_str()
+                    .expect("ProSA temp dir should be a valid String")
+            ),
         };
         let mut client_ssl_config = SslConfig::default();
         client_ssl_config.set_store(client_ssl_store);
         client_ssl_config.set_alpn(vec!["h2".into()]);
 
         let test_settings = HttpTestSettings::new(
-            Url::parse("https://localhost:49543").unwrap(),
+            Url::parse("https://localhost:49543").expect("HTTP2 client/server URL should be valid"),
             Some(server_ssl_config),
             Some(client_ssl_config),
         );
 
         // Run a ProSA to test
-        run_test(test_settings, Some(client_cert), true).await;
+        assert!(
+            run_test(test_settings, Some(client_cert), true)
+                .await
+                .is_ok()
+        );
     }
 }
