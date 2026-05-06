@@ -177,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bus.clone(),
         prosa_hyper_settings.hyper_client,
     );
-    Proc::<HyperDemoAdaptor>::run(http_proc);
+    Proc::<HyperDemoAdaptor>::run(http_proc)?;
 
     if matches.contains_id("inj") && matches.get_flag("inj") {
         debug!("Start a Inj processor");
@@ -188,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bus.clone(),
             inj_settings,
         );
-        Proc::<HyperDemoAdaptor>::run(inj_proc);
+        Proc::<HyperDemoAdaptor>::run(inj_proc)?;
     }
 
     // Wait on main task

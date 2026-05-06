@@ -465,7 +465,7 @@ mod tests {
             bus.clone(),
             settings.stub,
         );
-        Proc::<TestAdaptor>::run(http_server_stub);
+        Proc::<TestAdaptor>::run(http_server_stub)?;
 
         // Launch an HTTP server processor
         let http_server_proc = HyperServerProc::<SimpleStringTvf>::create(
@@ -474,7 +474,7 @@ mod tests {
             bus.clone(),
             settings.server,
         );
-        Proc::<TestAdaptor>::run(http_server_proc);
+        Proc::<TestAdaptor>::run(http_server_proc)?;
 
         // Wait for processor to start
         std::thread::sleep(WAIT_TIME);
@@ -486,7 +486,7 @@ mod tests {
             bus.clone(),
             settings.client,
         );
-        Proc::<TestAdaptor>::run(http_client_proc);
+        Proc::<TestAdaptor>::run(http_client_proc)?;
 
         // Launch an HTTP injector processor
         let http_inj_proc = InjProc::<SimpleStringTvf>::create(
@@ -495,7 +495,7 @@ mod tests {
             bus.clone(),
             settings.inj,
         );
-        Proc::<TestAdaptor>::run(http_inj_proc);
+        Proc::<TestAdaptor>::run(http_inj_proc)?;
 
         // Wait for processor to finish processing
         std::thread::sleep(WAIT_TIME);

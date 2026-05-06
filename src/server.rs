@@ -100,7 +100,7 @@ mod tests {
             bus.clone(),
             settings.server,
         );
-        Proc::<ServerTestAdaptor>::run(http_server_proc);
+        Proc::<ServerTestAdaptor>::run(http_server_proc)?;
 
         // Wait for processor to start
         std::thread::sleep(Duration::from_secs(1));
