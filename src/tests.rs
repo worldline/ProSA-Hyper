@@ -13,7 +13,7 @@ use openssl::{
 use prosa::{core::settings::settings, inj::proc::InjSettings, stub::proc::StubSettings};
 use prosa_utils::config::{ConfigError, os_country, ssl::SslConfig};
 use serde::Serialize;
-use std::{fs::File, io::Write as _};
+use std::{fs::File, io::Write as _, num::TryFromIntError};
 
 use crate::{client::proc::HyperClientSettings, server::proc::HyperServerSettings};
 
@@ -58,8 +58,17 @@ impl HttpTestSettings {
         let serial_number = Asn1Integer::from_bn(&serial_bn)?;
         cert.set_serial_number(&serial_number)?;
 
-        let begin_valid_time =
-            Asn1Time::from_unix(std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() as i64 - 360)?;
+        let begin_valid_time = Asn1Time::from_unix(
+            (std::time::UNIX_EPOCH
+                .elapsed()
+                .expect("UNIX epoch should be valid")
+                .as_secs()
+                - 360)
+                .try_into()
+                .map_err(|e: TryFromIntError| {
+                    ConfigError::WrongValue("Asn1Time::from_UNIX_EPOCH".to_string(), e.to_string())
+                })?,
+        )?;
         cert.set_not_before(&begin_valid_time)?;
         let end_valid_time = Asn1Time::days_from_now(3)?; // 3 days from now
         cert.set_not_after(&end_valid_time)?;
@@ -150,7 +159,7 @@ mod tests {
         msg::simple_string_tvf::SimpleStringTvf,
     };
     use std::{
-        env, fs,
+        env, fs, io,
         sync::atomic::{AtomicU32, Ordering},
     };
     use tokio::{runtime, time};
@@ -429,25 +438,25 @@ mod tests {
         }
     }
 
-    async fn run_test(settings: HttpTestSettings, test_type: u64) {
+    async fn run_test(settings: HttpTestSettings, test_type: u64) -> Result<(), io::Error> {
         // Create bus and main processor
         let (bus, main) = MainProc::<SimpleStringTvf>::create(&settings, Some(4));
 
         // Launch the main task in a separate thread to run the ProSA runtime
-        let main_handle = std::thread::Builder::new()
-            .name("main".to_string())
-            .spawn(move || {
-                runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .enable_all()
-                    .thread_name("main")
-                    .build()
-                    .unwrap()
-                    .block_on(async {
-                        main.run().await;
-                    })
-            })
-            .unwrap();
+        let main_handle =
+            std::thread::Builder::new()
+                .name("main".to_string())
+                .spawn(move || {
+                    runtime::Builder::new_multi_thread()
+                        .worker_threads(1)
+                        .enable_all()
+                        .thread_name("main")
+                        .build()
+                        .expect("Runtime should be valid")
+                        .block_on(async {
+                            main.run().await;
+                        })
+                })?;
 
         // Launch stub to respond to the HTTP server
         let http_server_stub = StubProc::<SimpleStringTvf>::create(
@@ -456,7 +465,7 @@ mod tests {
             bus.clone(),
             settings.stub,
         );
-        Proc::<TestAdaptor>::run(http_server_stub);
+        Proc::<TestAdaptor>::run(http_server_stub)?;
 
         // Launch an HTTP server processor
         let http_server_proc = HyperServerProc::<SimpleStringTvf>::create(
@@ -465,7 +474,7 @@ mod tests {
             bus.clone(),
             settings.server,
         );
-        Proc::<TestAdaptor>::run(http_server_proc);
+        Proc::<TestAdaptor>::run(http_server_proc)?;
 
         // Wait for processor to start
         std::thread::sleep(WAIT_TIME);
@@ -477,7 +486,7 @@ mod tests {
             bus.clone(),
             settings.client,
         );
-        Proc::<TestAdaptor>::run(http_client_proc);
+        Proc::<TestAdaptor>::run(http_client_proc)?;
 
         // Launch an HTTP injector processor
         let http_inj_proc = InjProc::<SimpleStringTvf>::create(
@@ -486,14 +495,14 @@ mod tests {
             bus.clone(),
             settings.inj,
         );
-        Proc::<TestAdaptor>::run(http_inj_proc);
+        Proc::<TestAdaptor>::run(http_inj_proc)?;
 
         // Wait for processor to finish processing
         std::thread::sleep(WAIT_TIME);
 
         bus.stop("ProSA HTTP client server unit test end".into())
             .await
-            .unwrap();
+            .map_err(io::Error::other)?;
 
         assert!(
             COUNTER[test_type as usize].load(Ordering::SeqCst) > 0,
@@ -503,15 +512,19 @@ mod tests {
 
         // Wait on main task to end
         let _ = main_handle.join();
+        Ok(())
     }
 
     #[tokio::test]
     async fn http_client_server() {
-        let test_settings =
-            HttpTestSettings::new(Url::parse("http://localhost:48080").unwrap(), None, None);
+        let test_settings = HttpTestSettings::new(
+            Url::parse("http://localhost:48080").expect("HTTP client/server URL should be valid"),
+            None,
+            None,
+        );
 
         // Run a ProSA to test
-        run_test(test_settings, 0).await;
+        assert!(run_test(test_settings, 0).await.is_ok());
     }
 
     #[tokio::test]
@@ -520,30 +533,43 @@ mod tests {
         let prosa_temp_dir = env::temp_dir().join(PROSA_HTTPS_TEST_DIR_NAME);
 
         let _ = fs::remove_dir_all(&prosa_temp_dir);
-        fs::create_dir_all(&prosa_temp_dir).unwrap();
+        fs::create_dir_all(&prosa_temp_dir)
+            .expect("Can't create ProSA temporary directory for HTTPS");
 
         let key_path = prosa_temp_dir.join("prosa_https.key");
         let cert_path = prosa_temp_dir.join("prosa_https.pem");
         let server_ssl_config = HttpTestSettings::create_server_cert(
-            key_path.as_os_str().to_str().unwrap().into(),
-            cert_path.as_os_str().to_str().unwrap().into(),
+            key_path
+                .as_os_str()
+                .to_str()
+                .expect("Key path should be a valid String")
+                .into(),
+            cert_path
+                .as_os_str()
+                .to_str()
+                .expect("Cert path should be a valid String")
+                .into(),
         )
-        .unwrap();
+        .expect("Server certificate should be created");
 
         let client_ssl_store = Store::File {
-            path: prosa_temp_dir.as_os_str().to_str().unwrap().into(),
+            path: prosa_temp_dir
+                .as_os_str()
+                .to_str()
+                .expect("ProSA temp dir should be a valid String")
+                .into(),
         };
         let mut client_ssl_config = SslConfig::default();
         client_ssl_config.set_store(client_ssl_store);
 
         let test_settings = HttpTestSettings::new(
-            Url::parse("https://localhost:48443").unwrap(),
+            Url::parse("https://localhost:48443").expect("HTTPS client/server URL should be valid"),
             Some(server_ssl_config),
             Some(client_ssl_config),
         );
 
         // Run a ProSA to test
-        run_test(test_settings, 1).await;
+        assert!(run_test(test_settings, 1).await.is_ok());
     }
 
     #[tokio::test]
@@ -552,32 +578,46 @@ mod tests {
         let prosa_temp_dir = env::temp_dir().join(PROSA_H2_TEST_DIR_NAME);
 
         let _ = fs::remove_dir_all(&prosa_temp_dir);
-        fs::create_dir_all(&prosa_temp_dir).unwrap();
+        fs::create_dir_all(&prosa_temp_dir).expect("Can't create ProSA temporary directory for H2");
 
         let key_path = prosa_temp_dir.join("prosa_h2.key");
         let cert_path = prosa_temp_dir.join("prosa_h2.pem");
         let mut server_ssl_config = HttpTestSettings::create_server_cert(
-            key_path.as_os_str().to_str().unwrap().into(),
-            cert_path.as_os_str().to_str().unwrap().into(),
+            key_path
+                .as_os_str()
+                .to_str()
+                .expect("Key path should be a valid String")
+                .into(),
+            cert_path
+                .as_os_str()
+                .to_str()
+                .expect("Cert path should be a valid String")
+                .into(),
         )
-        .unwrap();
+        .expect("Server certificate should be created");
         // Need to set the ALPN for server because of inline configuration @see TargetSetting::new
         server_ssl_config.set_alpn(vec!["h2".into()]);
 
         let client_ssl_store = Store::File {
-            path: format!("{}/", prosa_temp_dir.as_os_str().to_str().unwrap()),
+            path: format!(
+                "{}/",
+                prosa_temp_dir
+                    .as_os_str()
+                    .to_str()
+                    .expect("ProSA temp dir should be a valid String")
+            ),
         };
         let mut client_ssl_config = SslConfig::default();
         client_ssl_config.set_store(client_ssl_store);
         client_ssl_config.set_alpn(vec!["h2".into()]);
 
         let test_settings = HttpTestSettings::new(
-            Url::parse("h2://localhost:49443").unwrap(),
+            Url::parse("h2://localhost:49443").expect("HTTP2 client/server URL should be valid"),
             Some(server_ssl_config),
             Some(client_ssl_config),
         );
 
         // Run a ProSA to test
-        run_test(test_settings, 2).await;
+        assert!(run_test(test_settings, 2).await.is_ok());
     }
 }

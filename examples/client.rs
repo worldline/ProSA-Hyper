@@ -139,18 +139,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get_matches();
 
     // load the configuration
-    let config = Config::builder()
-        .add_source(config::File::with_name(
-            matches.get_one::<String>("config").unwrap().as_str(),
-        ))
+    let mut config_builder = Config::builder();
+    if let Some(config_file) = matches
+        .get_one::<String>("config")
+        .map(|c| config::File::with_name(c.as_str()))
+    {
+        config_builder = config_builder.add_source(config_file);
+    }
+    let config = config_builder
         .add_source(
             config::Environment::with_prefix("PROSA")
                 .try_parsing(true)
                 .separator("_")
                 .list_separator(" "),
         )
-        .build()
-        .unwrap();
+        .build()?;
 
     let prosa_hyper_settings = config.try_deserialize::<MainHyperSettings>()?;
     let service_name = prosa_hyper_settings.hyper_client.service_name.clone();
@@ -174,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bus.clone(),
         prosa_hyper_settings.hyper_client,
     );
-    Proc::<HyperDemoAdaptor>::run(http_proc);
+    Proc::<HyperDemoAdaptor>::run(http_proc)?;
 
     if matches.contains_id("inj") && matches.get_flag("inj") {
         debug!("Start a Inj processor");
@@ -185,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bus.clone(),
             inj_settings,
         );
-        Proc::<HyperDemoAdaptor>::run(inj_proc);
+        Proc::<HyperDemoAdaptor>::run(inj_proc)?;
     }
 
     // Wait on main task

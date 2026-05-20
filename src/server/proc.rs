@@ -38,9 +38,11 @@ pub struct HyperServerSettings {
 
 impl HyperServerSettings {
     fn default_listener() -> ListenerSetting {
-        let mut url = Url::parse("http://0.0.0.0:8080").unwrap();
+        let mut url =
+            Url::parse("http://0.0.0.0:8080").expect("Default Hyper server URL should be valid");
         if let Ok(Ok(port)) = env::var("PORT").map(|p| p.parse::<u16>()) {
-            url.set_port(Some(port)).unwrap();
+            url.set_port(Some(port))
+                .expect("Default Hyper server URL should be base");
         }
 
         ListenerSetting::new(url, None)
