@@ -25,7 +25,7 @@ The server configuration is straightforward.
 You only need to set a [ListenerSetting](https://docs.rs/prosa/latest/prosa/io/listener/struct.ListenerSetting.html) to configure.
 
 ```yaml
-http_server:
+hyper_server:
   listener:
     url: https://0.0.0.0:443
     ssl:
@@ -38,6 +38,9 @@ http_server:
 
 If you have some slow services, you can set the `service_timeout` parameter (800 ms by default).
 
+When ProSA stops, the processor releases its listening port right away so a new client is refused
+instead of waiting, then answers the requests it still has in flight before shutting down.
+
 ### Client
 
 The client exposes a service if it is available.
@@ -45,15 +48,22 @@ For backends, you need to use [TargetSetting](https://docs.rs/prosa/latest/prosa
 All backends will be load-balanced with ProSA's internal service load balancing.
 
 ```yaml
-http_client:
+hyper_client:
   service_name: "service_name"
-  min_socket: 1
-  max_socket: 20
+  nb_socket: 1
   backends:
     - url: http://backend01:8080
 ```
 
+`nb_socket` is how many connections the processor keeps open to each backend (one by default).
+An HTTP/1.1 socket serves one request at a time, so it is worth raising against a plain backend;
+an HTTP/2 one multiplexes them.
+
 If you have a slow backend response, you can set the `http_timeout` parameter (5 seconds by default).
+
+A socket that can't reach its backend is retried instead of being dropped. It waits `reconnect_delay`
+(500 ms by default), doubling that delay on every consecutive failure, up to `max_reconnect_delay`
+(30 seconds by default).
 
 ## Examples
 
@@ -70,8 +80,8 @@ cargo run --example server
 ```
 
 The server provides the following targets:
- - [/](http://localhost:8080/) returns the ProSA name
- - [/test](http://localhost:8080/test) contacts an internal service named SRV_TEST (requires starting the stub processor)
+ - [/](https://localhost:8443/) returns the ProSA name
+ - [/test](https://localhost:8443/test) contacts an internal service named SRV_TEST (requires starting the stub processor)
  - [metrics](http://localhost:9090/metrics) exposes Prometheus metrics as configured
 
 ### Client

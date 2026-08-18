@@ -100,7 +100,11 @@ where
             .listener
             .set_alpn(vec!["h2".into(), "http/1.1".into()]);
 
-        let bound_listener = self.settings.listener.bind().await?;
+        // The listener is shared with every task that handshakes a client, so it can't be replaced
+        // to serve a new certificate. `bind_raw` leaves the SSL parameters out of it and hands them
+        // over instead, which makes the handshaker below the only copy and a rotation a plain
+        // assignment. `None` when the processor listens without SSL
+        let (bound_listener, mut handshaker) = self.settings.listener.bind_raw().await?;
         let local_addr = bound_listener.local_addr()?;
         let mut listener = Some(Arc::new(bound_listener));
         info!("Listening on {local_addr}");
@@ -170,17 +174,43 @@ where
                                 // Normalize the ALPN as done at startup before comparing
                                 settings.listener.set_alpn(vec!["h2".into(), "http/1.1".into()]);
 
-                                if settings.listener != self.settings.listener {
-                                    match settings.listener.bind().await {
-                                        Ok(new_listener) => {
-                                            let local_addr = new_listener.local_addr()?;
+                                // Only listening somewhere else needs a new socket. Turning SSL on,
+                                // off, or rotating a certificate is served on the socket that is
+                                // already bound, by the handshaker rebuilt below
+                                if self.settings.listener.needs_rebind(&settings.listener) {
+                                    match settings.listener.bind_raw().await {
+                                        Ok((new_listener, new_handshaker)) => {
+                                            let local_addr = new_listener.local_addr();
+                                            handshaker = new_handshaker;
                                             listener = Some(Arc::new(new_listener));
-                                            info!("Reload the Hyper server processor configuration, listening on {local_addr}");
+                                            match local_addr {
+                                                Ok(addr) => info!("Reload the Hyper server processor configuration, listening on {addr}"),
+                                                Err(e) => info!("Reload the Hyper server processor configuration, can't read the address it bound: {e}"),
+                                            }
                                         }
                                         // An address the processor can't bind is no reason to lose the
                                         // one it serves on, so keep the listener and the settings that describe it
                                         Err(e) => {
                                             warn!("Can't listen on {}, keep the previous address: {e}", settings.listener.get_safe_url());
+                                            settings.listener = self.settings.listener.clone();
+                                        }
+                                    }
+                                } else {
+                                    // Built again whatever the configuration says, because it holds
+                                    // the path of the certificate and not the certificate: a renewal
+                                    // that rewrites the file in place leaves the two configurations
+                                    // equal, so comparing them would skip exactly the reload this is
+                                    // for. One file read, and neither the socket nor an established
+                                    // connection is touched
+                                    match settings.listener.build_handshaker().await {
+                                        Ok(new_handshaker) => {
+                                            handshaker = new_handshaker;
+                                            info!("Reload the Hyper server processor configuration, serving {}", settings.listener.get_safe_url());
+                                        }
+                                        // The processor keeps serving the certificate it has, so the
+                                        // settings have to keep describing it
+                                        Err(e) => {
+                                            warn!("Can't serve the certificate of {}, keep the previous one: {e}", settings.listener.get_safe_url());
                                             settings.listener = self.settings.listener.clone();
                                         }
                                     }
@@ -241,21 +271,22 @@ where
 
                     // The watcher is taken before the connection is spawned, so a shutdown asked
                     // in between is not missed
-                    let (Some(listener), Some(watcher)) = (accept_listener.clone(), graceful.as_ref().map(GracefulShutdown::watcher)) else {
+                    let Some(watcher) = graceful.as_ref().map(GracefulShutdown::watcher) else {
                         continue;
                     };
 
+                    // Owned snapshot of the SSL parameters, so a rotation doesn't wait for the
+                    // handshake and the client is served the certificate of its accept
+                    let handshaker = handshaker.clone();
                     let service_adaptor = adaptor.clone();
                     let http_tx = http_tx.clone();
                     let http_counter = observable_http_counter.clone();
                     let http_socket = observable_http_socket.clone();
                     tokio::task::spawn(async move {
-                        let handshake = listener.handshake(stream).await;
-
-                        // Only the handshake needs the listener. Release it right away so a listener
-                        // retired by a configuration reload doesn't stay bound until the last
-                        // connection it accepted is closed
-                        drop(listener);
+                        let handshake = match handshaker {
+                            Some(handshaker) => handshaker.handshake(stream).await,
+                            None => Ok(stream),
+                        };
 
                         match handshake {
                             Ok(stream) => {

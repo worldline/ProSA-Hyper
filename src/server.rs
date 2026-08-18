@@ -478,6 +478,129 @@ mod tests {
         let _ = main_task.await;
     }
 
+    /// Open a TLS connection and give back the certificate the server presented.
+    ///
+    /// Done with openssl rather than `reqwest`, which verifies the certificate and then keeps it to
+    /// itself. Blocking, so it runs off the test runtime
+    async fn served_certificate(addr: String) -> Option<Vec<u8>> {
+        tokio::task::spawn_blocking(move || {
+            let mut connector = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls())
+                .expect("The test TLS connector should build");
+            // Which certificate is served is the whole point, whether it is trusted isn't
+            connector.set_verify(openssl::ssl::SslVerifyMode::NONE);
+
+            let stream = std::net::TcpStream::connect(&addr).ok()?;
+            let stream = connector.build().connect("localhost", stream).ok()?;
+            let certificate = stream.ssl().peer_certificate()?;
+            certificate.to_pem().ok()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    #[tokio::test]
+    async fn server_certificate_reload() {
+        const PROC_NAME: &str = "SRV_CERT_RELOAD_PROC";
+        const PROSA_CERT_RELOAD_TEST_DIR_NAME: &str = "ProSA_server_cert_reload";
+
+        let prosa_temp_dir = env::temp_dir().join(PROSA_CERT_RELOAD_TEST_DIR_NAME);
+        let _ = fs::remove_dir_all(&prosa_temp_dir);
+        fs::create_dir_all(&prosa_temp_dir)
+            .expect("Can't create ProSA temporary directory for the certificate reload");
+
+        let key_path = prosa_temp_dir.join("prosa_server_cert_reload.key");
+        let cert_path = prosa_temp_dir.join("prosa_server_cert_reload.pem");
+        let key_path = key_path
+            .to_str()
+            .expect("Key path should be a valid String")
+            .to_string();
+        let cert_path = cert_path
+            .to_str()
+            .expect("Cert path should be a valid String")
+            .to_string();
+
+        let server_ssl_config =
+            HttpTestSettings::create_server_cert(key_path.clone(), cert_path.clone())
+                .expect("Server certificate should be created");
+
+        let settings = HttpTestSettings::new(
+            Url::parse("https://localhost:0").expect("Certificate reload URL should be valid"),
+            Some(server_ssl_config),
+            None,
+        );
+        let initial_url = settings.server.listener.url.clone();
+
+        // Create bus and main processor
+        let (bus, main) = MainProc::<SimpleStringTvf>::create(&settings, Some(1));
+
+        // The main task must run to broadcast the configuration to the processors
+        let main_task = tokio::spawn(main.run());
+
+        // Launch an HTTP server processor
+        let http_server_proc = HyperServerProc::<SimpleStringTvf>::create(
+            1,
+            String::from(PROC_NAME),
+            bus.clone(),
+            settings.server,
+        );
+        Proc::<ServerTestAdaptor>::run(http_server_proc)
+            .expect("Hyper server processor should run");
+
+        // The listener is on the port 0, the processor publishes where it bound
+        let bound = bound_url(PROC_NAME, &initial_url).await;
+        let addr = format!(
+            "localhost:{}",
+            bound.port().expect("Bound URL should have a port")
+        );
+
+        let first_certificate = served_certificate(addr.clone())
+            .await
+            .expect("The server should present a certificate");
+
+        // Renew it under the very same paths, which is what a certificate manager does. The
+        // configuration is left describing exactly what it described before
+        HttpTestSettings::create_server_cert(key_path.clone(), cert_path.clone())
+            .expect("Server certificate should be renewed");
+
+        // Reload with settings equal to the running ones, down to the URL: the port is still the 0
+        // the processor was given, so a rebind would land on another port and the address below
+        // would stop answering altogether
+        let reloaded = format!(
+            "{PROC_NAME}:\n  listener:\n    url: {}\n    ssl:\n      cert: {cert_path}\n      key: {key_path}\n      passphrase: {}\n",
+            initial_url.as_str(),
+            HttpTestSettings::PASSPHRASE,
+        );
+        let config = ProsaConfig::from_config(
+            config::Config::builder()
+                .add_source(config::File::from_str(&reloaded, config::FileFormat::Yaml))
+                .build()
+                .expect("Reloaded configuration should be valid"),
+        )
+        .expect("Reloaded ProSA configuration should be valid");
+        bus.update_config(Arc::new(config))
+            .await
+            .expect("ProSA configuration should be updated");
+
+        // The new certificate is served, on the socket that was never rebound
+        assert!(
+            wait_for(TEST_TIMEOUT, async || {
+                served_certificate(addr.clone())
+                    .await
+                    .is_some_and(|certificate| certificate != first_certificate)
+            })
+            .await,
+            "The Hyper server processor should serve the renewed certificate on {addr}"
+        );
+
+        bus.stop("ProSA HTTP server certificate reload unit test end".into())
+            .await
+            .expect("ProSA should stop");
+
+        // Wait on main task to end
+        let _ = main_task.await;
+    }
+
     #[tokio::test]
     async fn server_graceful_shutdown() {
         const PROC_NAME: &str = "SRV_SHUTDOWN_PROC";
