@@ -10,13 +10,15 @@ pub(crate) mod service;
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use http_body_util::{Full, combinators::BoxBody};
+    use http_body_util::{Empty, Full, combinators::BoxBody};
     use hyper::{Request, StatusCode};
+    use hyper_util::rt::TokioIo;
     use prosa::core::{
         adaptor::Adaptor,
         error::ProcError,
         main::{MainProc, MainRunnable as _},
-        proc::{Proc, ProcConfig as _},
+        proc::{Proc, ProcBusParam as _, ProcConfig as _},
+        settings::ProsaConfig,
     };
     use prosa_utils::{
         config::ssl::{SslConfig, Store},
@@ -27,6 +29,11 @@ mod tests {
         env,
         fs::{self, File},
         io::{self, Read as _},
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         time::Duration,
     };
     use tokio::time;
@@ -35,7 +42,7 @@ mod tests {
     use crate::{
         HyperResp,
         server::{adaptor::HyperServerAdaptor, proc::HyperServerProc},
-        tests::HttpTestSettings,
+        tests::{HttpTestSettings, TEST_TIMEOUT, bound_url, set_bound_port, wait_for},
     };
 
     const WAIT_TIME: time::Duration = time::Duration::from_secs(5);
@@ -57,11 +64,15 @@ mod tests {
             + std::default::Default,
     {
         fn new(
-            _proc: &crate::server::proc::HyperServerProc<M>,
+            proc: &crate::server::proc::HyperServerProc<M>,
+            addr: prosa::io::SocketAddr,
         ) -> Result<Self, Box<dyn ProcError + Send + Sync>>
         where
             Self: Sized,
         {
+            // The listener is configured on the port 0, this is where the test learns where it landed
+            set_bound_port(proc.name(), addr.port());
+
             Ok(ServerTestAdaptor {})
         }
 
@@ -80,10 +91,72 @@ mod tests {
         }
     }
 
+    /// Time [`SlowServerTestAdaptor`] takes to answer its first request, long enough to still be
+    /// serving when ProSA stops. Every further request takes a multiple of it, so the requests in
+    /// flight don't all end at the same moment
+    const SLOW_RESPONSE_TIME: time::Duration = time::Duration::from_millis(300);
+
+    /// Number of requests [`SlowServerTestAdaptor`] started answering, so a test knows how many are
+    /// in flight, and so each one can be given a different response time
+    static SLOW_REQUESTS_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Set when the Hyper server processor reaches the end of its loop, which it only does once
+    /// every connection has been drained
+    static SLOW_PROC_TERMINATED: AtomicBool = AtomicBool::new(false);
+
+    /// Adaptor that takes its time to answer, so a request is still being served when ProSA stops
+    #[derive(Clone)]
+    struct SlowServerTestAdaptor {
+        // Nothing
+    }
+
+    impl Adaptor for SlowServerTestAdaptor {
+        fn terminate(&self) {
+            SLOW_PROC_TERMINATED.store(true, Ordering::Relaxed);
+        }
+    }
+
+    impl<M> HyperServerAdaptor<M> for SlowServerTestAdaptor
+    where
+        M: 'static
+            + std::marker::Send
+            + std::marker::Sync
+            + std::marker::Sized
+            + std::clone::Clone
+            + std::fmt::Debug
+            + prosa_utils::msg::tvf::Tvf
+            + std::default::Default,
+    {
+        fn new(
+            proc: &crate::server::proc::HyperServerProc<M>,
+            addr: prosa::io::SocketAddr,
+        ) -> Result<Self, Box<dyn ProcError + Send + Sync>>
+        where
+            Self: Sized,
+        {
+            set_bound_port(proc.name(), addr.port());
+
+            Ok(SlowServerTestAdaptor {})
+        }
+
+        async fn process_http_request(
+            &self,
+            _req: Request<hyper::body::Incoming>,
+        ) -> HyperResp<Self, M> {
+            let request_index = SLOW_REQUESTS_STARTED.fetch_add(1, Ordering::Relaxed);
+            time::sleep(SLOW_RESPONSE_TIME * (request_index as u32 + 1)).await;
+
+            <SlowServerTestAdaptor as HyperServerAdaptor<M>>::response_builder(self, StatusCode::OK)
+                .body(BoxBody::new(Full::new(Bytes::from("Hello, slow world"))))
+                .into()
+        }
+    }
+
     async fn run_test(
         settings: HttpTestSettings,
         certificate: Option<Certificate>,
         http2: bool,
+        proc_name: &str,
     ) -> io::Result<()> {
         let url = settings.server.listener.url.clone();
 
@@ -96,14 +169,14 @@ mod tests {
         // Launch an HTTP server processor
         let http_server_proc = HyperServerProc::<SimpleStringTvf>::create(
             1,
-            String::from("HTTP_SERVER_PROC"),
+            String::from(proc_name),
             bus.clone(),
             settings.server,
         );
         Proc::<ServerTestAdaptor>::run(http_server_proc)?;
 
-        // Wait for processor to start
-        std::thread::sleep(Duration::from_secs(1));
+        // The listener is on the port 0, the processor publishes where it bound
+        let url = bound_url(proc_name, &url).await;
 
         // Send request to the server with reqwest
         let mut client_builder = reqwest::ClientBuilder::new()
@@ -148,13 +221,17 @@ mod tests {
     #[tokio::test]
     async fn http_client_server() {
         let test_settings = HttpTestSettings::new(
-            Url::parse("http://localhost:48180").expect("HTTP client/server URL should be valid"),
+            Url::parse("http://localhost:0").expect("HTTP client/server URL should be valid"),
             None,
             None,
         );
 
         // Run a ProSA to test
-        assert!(run_test(test_settings, None, false).await.is_ok());
+        assert!(
+            run_test(test_settings, None, false, "SRV_HTTP_PROC")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -203,14 +280,14 @@ mod tests {
         client_ssl_config.set_store(client_ssl_store);
 
         let test_settings = HttpTestSettings::new(
-            Url::parse("https://localhost:48543").expect("HTTPS client/server URL should be valid"),
+            Url::parse("https://localhost:0").expect("HTTPS client/server URL should be valid"),
             Some(server_ssl_config),
             Some(client_ssl_config),
         );
 
         // Run a ProSA to test
         assert!(
-            run_test(test_settings, Some(client_cert), false)
+            run_test(test_settings, Some(client_cert), false, "SRV_HTTPS_PROC")
                 .await
                 .is_ok()
         );
@@ -230,7 +307,7 @@ mod tests {
             .as_os_str()
             .to_str()
             .expect("Cert path should be a valid String");
-        let mut server_ssl_config = HttpTestSettings::create_server_cert(
+        let server_ssl_config = HttpTestSettings::create_server_cert(
             key_path
                 .as_os_str()
                 .to_str()
@@ -239,8 +316,6 @@ mod tests {
             cert_path_str.into(),
         )
         .expect("Server certificate should be created");
-        // Need to set the ALPN for server because of inline configuration @see TargetSetting::new
-        server_ssl_config.set_alpn(vec!["h2".into()]);
 
         let mut buf = Vec::new();
         File::open(cert_path_str)
@@ -264,16 +339,241 @@ mod tests {
         client_ssl_config.set_alpn(vec!["h2".into()]);
 
         let test_settings = HttpTestSettings::new(
-            Url::parse("https://localhost:49543").expect("HTTP2 client/server URL should be valid"),
+            Url::parse("https://localhost:0").expect("HTTP2 client/server URL should be valid"),
             Some(server_ssl_config),
             Some(client_ssl_config),
         );
 
         // Run a ProSA to test
         assert!(
-            run_test(test_settings, Some(client_cert), true)
+            run_test(test_settings, Some(client_cert), true, "SRV_H2_PROC")
                 .await
                 .is_ok()
         );
+    }
+
+    /// Send a GET request through a UNIX socket, and return the status the server answered.
+    ///
+    /// A listener that binds without ever serving accepts connections all the same, so only a
+    /// complete round trip tells that the processor rebound
+    async fn unix_get(socket_path: &Path) -> Option<StatusCode> {
+        let stream = tokio::net::UnixStream::connect(socket_path).await.ok()?;
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .ok()?;
+        tokio::spawn(connection);
+
+        let request = Request::builder()
+            .uri("/")
+            .header(hyper::header::HOST, "localhost")
+            .body(Empty::<Bytes>::new())
+            .ok()?;
+
+        sender
+            .send_request(request)
+            .await
+            .ok()
+            .map(|resp| resp.status())
+    }
+
+    #[tokio::test]
+    async fn server_config_reload() {
+        const PROC_NAME: &str = "SRV_RELOAD_PROC";
+        const PROSA_RELOAD_TEST_DIR_NAME: &str = "ProSA_server_reload";
+
+        let settings = HttpTestSettings::new(
+            Url::parse("http://127.0.0.1:0").expect("Initial server URL should be valid"),
+            None,
+            None,
+        );
+        let initial_url = settings.server.listener.url.clone();
+
+        // A reload has to say where to go, and a port named before anything binds it is a port
+        // another test can be given in the meantime. A UNIX socket is an address the test owns
+        // outright, so the rebind lands where it is told
+        let prosa_temp_dir = env::temp_dir().join(PROSA_RELOAD_TEST_DIR_NAME);
+        let _ = fs::remove_dir_all(&prosa_temp_dir);
+        fs::create_dir_all(&prosa_temp_dir)
+            .expect("Can't create ProSA temporary directory for the configuration reload");
+        let socket_path = prosa_temp_dir.join("prosa_server_reload.sock");
+        let reloaded_url = Url::parse(&format!(
+            "unix://{}",
+            socket_path
+                .to_str()
+                .expect("Socket path should be a valid String")
+        ))
+        .expect("Reloaded server URL should be valid");
+
+        // Create bus and main processor
+        let (bus, main) = MainProc::<SimpleStringTvf>::create(&settings, Some(1));
+
+        // The main task must run to broadcast the configuration to the processors
+        let main_task = tokio::spawn(main.run());
+
+        // Launch an HTTP server processor
+        let http_server_proc = HyperServerProc::<SimpleStringTvf>::create(
+            1,
+            String::from(PROC_NAME),
+            bus.clone(),
+            settings.server,
+        );
+        Proc::<ServerTestAdaptor>::run(http_server_proc)
+            .expect("Hyper server processor should run");
+
+        // The listener is on the port 0, the processor publishes where it bound
+        let initial_url = bound_url(PROC_NAME, &initial_url).await;
+        let initial_addr = format!(
+            "127.0.0.1:{}",
+            initial_url.port().expect("Initial URL should have a port")
+        );
+
+        // The connection is kept alive on purpose: it outlives the rebind, and must not keep the
+        // retired listener bound
+        let client = reqwest::ClientBuilder::new()
+            .timeout(WAIT_TIME)
+            .build()
+            .expect("reqwest client should be valid");
+        let resp = client
+            .get(initial_url)
+            .send()
+            .await
+            .expect("Failed to send request to the initial URL");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Move the listener to another address
+        let config = ProsaConfig::from_config(
+            config::Config::builder()
+                .set_override(format!("{PROC_NAME}.listener.url"), reloaded_url.as_str())
+                .expect("Reloaded listener URL should be a valid config override")
+                .build()
+                .expect("Reloaded configuration should be valid"),
+        )
+        .expect("Reloaded ProSA configuration should be valid");
+        bus.update_config(Arc::new(config))
+            .await
+            .expect("ProSA configuration should be updated");
+
+        assert!(
+            wait_for(TEST_TIMEOUT, async || unix_get(&socket_path).await
+                == Some(StatusCode::OK))
+            .await,
+            "The Hyper server processor should serve on {reloaded_url}"
+        );
+
+        assert!(
+            wait_for(TEST_TIMEOUT, async || tokio::net::TcpListener::bind(
+                initial_addr.as_str()
+            )
+            .await
+            .is_ok())
+            .await,
+            "The initial listener should have been freed by the reload"
+        );
+
+        bus.stop("ProSA HTTP server configuration reload unit test end".into())
+            .await
+            .expect("ProSA should stop");
+
+        // Wait on main task to end
+        let _ = main_task.await;
+    }
+
+    #[tokio::test]
+    async fn server_graceful_shutdown() {
+        const PROC_NAME: &str = "SRV_SHUTDOWN_PROC";
+
+        let settings = HttpTestSettings::new(
+            Url::parse("http://127.0.0.1:0").expect("Graceful shutdown server URL should be valid"),
+            None,
+            None,
+        );
+        let url = settings.server.listener.url.clone();
+
+        // Create bus and main processor
+        let (bus, main) = MainProc::<SimpleStringTvf>::create(&settings, Some(1));
+        let main_task = tokio::spawn(main.run());
+
+        // Launch an HTTP server processor
+        let http_server_proc = HyperServerProc::<SimpleStringTvf>::create(
+            1,
+            String::from(PROC_NAME),
+            bus.clone(),
+            settings.server,
+        );
+        Proc::<SlowServerTestAdaptor>::run(http_server_proc)
+            .expect("Hyper server processor should run");
+
+        // The listener is on the port 0, the processor publishes where it bound
+        let url = bound_url(PROC_NAME, &url).await;
+        let addr = format!(
+            "127.0.0.1:{}",
+            url.port().expect("Bound URL should have a port")
+        );
+
+        // Fire a request on each of several connections and leave them all in flight. They are
+        // answered at different moments, so draining until the first one is done is not enough
+        const IN_FLIGHT_CONNECTIONS: usize = 3;
+        let mut in_flight = Vec::with_capacity(IN_FLIGHT_CONNECTIONS);
+        for _ in 0..IN_FLIGHT_CONNECTIONS {
+            let stream = tokio::net::TcpStream::connect(&addr)
+                .await
+                .expect("The Hyper server processor should accept a connection");
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
+                    .expect("The HTTP/1.1 handshake should succeed");
+            tokio::spawn(connection);
+            let request = Request::builder()
+                .uri("/")
+                .header(hyper::header::HOST, "localhost")
+                .body(Empty::<Bytes>::new())
+                .expect("The request should be valid");
+            in_flight.push(tokio::spawn(
+                async move { sender.send_request(request).await },
+            ));
+        }
+
+        assert!(
+            wait_for(TEST_TIMEOUT, async || SLOW_REQUESTS_STARTED
+                .load(Ordering::Relaxed)
+                >= IN_FLIGHT_CONNECTIONS)
+            .await,
+            "The Hyper server processor should be serving every request"
+        );
+
+        bus.stop("ProSA HTTP server graceful shutdown unit test end".into())
+            .await
+            .expect("ProSA should stop");
+
+        // The listener is released as the drain starts, so a new client is told right away instead
+        // of waiting in the accept queue of a server that will never take it
+        assert!(
+            wait_for(TEST_TIMEOUT, async || tokio::net::TcpStream::connect(&addr)
+                .await
+                .is_err())
+            .await,
+            "A new connection should be refused once the processor stops accepting"
+        );
+
+        // Every connection is answered, not just the one that finished first
+        for request in in_flight {
+            let resp = request
+                .await
+                .expect("The in flight request should not be dropped")
+                .expect("The Hyper server processor should answer the request it was serving");
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // The drain completing is what ends the loop, so the processor only terminates once it has
+        // nothing left to serve
+        assert!(
+            wait_for(TEST_TIMEOUT, async || SLOW_PROC_TERMINATED
+                .load(Ordering::Relaxed))
+            .await,
+            "The Hyper server processor should terminate once its connections are drained"
+        );
+
+        // Wait on main task to end
+        let _ = main_task.await;
     }
 }
