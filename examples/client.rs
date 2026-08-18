@@ -1,28 +1,34 @@
-use std::convert::Infallible;
-use std::env;
+use std::{convert::Infallible, env};
 
 use bytes::Bytes;
 use clap::{ArgAction, Command, arg};
 use config::Config;
-use http_body_util::Empty;
-use http_body_util::combinators::BoxBody;
+use http_body_util::{Empty, combinators::BoxBody};
 use hyper::{Request, Response};
-use prosa::core::adaptor::Adaptor;
-use prosa::core::error::ProcError;
-use prosa::core::main::MainProc;
-use prosa::core::main::MainRunnable as _;
-use prosa::core::proc::{Proc, ProcBusParam, ProcConfig};
-use prosa::core::service::ServiceError;
-use prosa::core::settings::settings;
-use prosa::inj::adaptor::InjAdaptor;
-use prosa::inj::proc::{InjProc, InjSettings};
-use prosa_hyper::PRODUCT_VERSION_HEADER;
-use prosa_hyper::client::adaptor::HyperClientAdaptor;
-use prosa_hyper::client::proc::{HyperClientProc, HyperClientSettings};
-use prosa_utils::config::tracing::TelemetryFilter;
-use prosa_utils::msg::simple_string_tvf::SimpleStringTvf;
+use prosa::{
+    core::{
+        adaptor::Adaptor,
+        error::ProcError,
+        main::{MainProc, MainRunnable as _},
+        proc::{Proc, ProcBusParam, ProcConfig},
+        service::ServiceError,
+        settings::settings,
+    },
+    inj::{
+        adaptor::InjAdaptor,
+        proc::{InjProc, InjSettings},
+    },
+    tracing::debug,
+};
+use prosa_hyper::{
+    PRODUCT_VERSION_HEADER,
+    client::{
+        adaptor::HyperClientAdaptor,
+        proc::{HyperClientProc, HyperClientSettings},
+    },
+};
+use prosa_utils::{config::tracing::TelemetryFilter, msg::simple_string_tvf::SimpleStringTvf};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
 use url::Url;
 
 /// Demo Hyper processor adaptor

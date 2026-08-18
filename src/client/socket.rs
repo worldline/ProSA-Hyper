@@ -1,19 +1,34 @@
+//! Hyper client sockets
+//!
+//! A socket decides nothing. The processor tells it which backend to connect to and when to stop,
+//! it serves what its bus queue brings until the connection ends, then hands itself back.
+//!
+//! Two channels reach a socket, and they carry different things. The bus queue carries the
+//! requests, and it is as deep as the traffic the socket is behind on, so anything put there is
+//! only read once the socket caught up. What the processor decides — the message timeout, and
+//! whether the socket should stop — goes through a [`watch`] channel instead, which is always
+//! current, reaches a socket that is busy serving, and never blocks the processor's loop.
+
 use std::{
     convert::Infallible,
     io,
+    ops::ControlFlow,
     os::fd::AsRawFd,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use hyper::{
-    Request,
+    Request, Response,
+    body::Incoming,
     client::conn::{http1, http2},
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use opentelemetry::{KeyValue, metrics::Histogram};
 use prosa::{
     core::{
         adaptor::Adaptor,
@@ -21,114 +36,263 @@ use prosa::{
         proc::{ProcBusParam as _, ProcParam},
         service::ServiceError,
     },
-    io::{
-        SslConfig,
-        stream::{Stream, TargetSetting},
-        url_is_ssl,
+    io::stream::{Stream, TargetSetting},
+    otel::{
+        KeyValue,
+        metrics::{Histogram, UpDownCounter},
     },
+    tracing::{debug, info, warn},
 };
 use tokio::{
+    sync::{mpsc, watch},
     task::JoinSet,
     time::{self, timeout},
 };
-use tracing::{debug, info, warn};
 
-use crate::{H2, HyperProcError, client::adaptor::HyperClientAdaptor, hyper_version_str};
+use crate::{
+    H2, HyperProcError,
+    client::{adaptor::HyperClientAdaptor, proc::HyperClientSettings},
+    hyper_version_str,
+};
 
 /// Type alias for HTTP request pair to reduce type complexity
 type HttpRequestPair<M> = (RequestMsg<M>, Request<BoxBody<Bytes, Infallible>>);
 
-/// Hyper client socket
+/// Instruments reported by the Hyper client sockets
 #[derive(Debug, Clone)]
-pub struct HyperClientSocket {
+pub(super) struct SocketMeters {
+    /// Duration of the HTTP messages
+    message_histogram: Histogram<u64>,
+    /// Number of connected sockets
+    socket_counter: UpDownCounter<i64>,
+}
+
+impl SocketMeters {
+    /// Create the instruments of the Hyper client sockets from the processor meter
+    pub(super) fn new(meter: &prosa::otel::metrics::Meter) -> Self {
+        SocketMeters {
+            message_histogram: meter
+                .u64_histogram("prosa_hyper_cli_duration")
+                .with_description("Hyper HTTP client request duration histogram")
+                .build(),
+            socket_counter: meter
+                .i64_up_down_counter("prosa_hyper_cli_socket")
+                .with_description("Hyper HTTP client connected socket counter")
+                .build(),
+        }
+    }
+}
+
+/// What the processor decides for one of its sockets, out of band from the requests it serves.
+///
+/// Everything that applies to the next attempt or the next message, so changing it doesn't retire a
+/// healthy socket. What defines the connection itself isn't here: a socket that has to reach
+/// somewhere else is a different socket
+#[derive(Debug)]
+pub(super) struct SocketControl {
+    /// Timeout applied to the next connection attempt, in milliseconds
+    pub(super) connect_timeout: u64,
+    /// Timeout applied to the next HTTP message
+    pub(super) http_timeout: Duration,
+    /// Set once the processor retires the socket
+    pub(super) stopped: bool,
+}
+
+impl SocketControl {
+    /// Open the control channel of a socket the processor is about to spawn
+    pub(super) fn channel(
+        connect_timeout: u64,
+        http_timeout: Duration,
+    ) -> (watch::Sender<Self>, watch::Receiver<Self>) {
+        watch::channel(SocketControl {
+            connect_timeout,
+            http_timeout,
+            stopped: false,
+        })
+    }
+}
+
+/// Report the duration of a message under the backend it was sent to.
+///
+/// The target is formatted rather than taken from the URL, so a backend configured with credentials
+/// doesn't put them in a metric attribute, and both protocols report under the same value
+fn record_message(
+    message_histogram: &Histogram<u64>,
+    target_addr: &str,
+    response: &Result<Response<Incoming>, hyper::Error>,
+    started: Instant,
+    default_version: &'static str,
+) {
+    let (code, version) = response.as_ref().map_or((500, default_version), |r| {
+        (r.status().as_u16() as i64, hyper_version_str(r.version()))
+    });
+
+    message_histogram.record(
+        started.elapsed().as_millis() as u64,
+        &[
+            KeyValue::new("target", target_addr.to_string()),
+            KeyValue::new("code", code),
+            KeyValue::new("version", version),
+        ],
+    );
+}
+
+/// Hyper client socket
+///
+/// A socket connects to its backend, serves what its bus queue brings until the connection ends or
+/// it is asked to stop, then hands itself back. Which sockets must exist is the processor's call,
+/// and the way it retires one is [`SocketControl::stopped`].
+#[derive(Debug)]
+pub(crate) struct HyperClientSocket<M>
+where
+    M: Sized + Clone + prosa::core::msg::Tvf,
+{
+    /// Bus queue id of the socket, stable across its reconnections
+    id: u32,
     /// Target of the socket
     target: TargetSetting,
-    /// Whether the socket is using HTTP/2
-    is_http2: bool,
-    /// HTTP message timeout duration
-    http_timeout: Duration,
+    /// Service the socket advertises on its bus queue
+    service_name: String,
+    /// Number of consecutive failed connection attempts, delaying the next reconnection
+    retry: u32,
+    /// What the processor decides for the socket, always current
+    control: watch::Receiver<SocketControl>,
+    /// Queue the bus brings the requests to.
+    ///
+    /// Kept across reconnections, so a request that arrives while the socket is down is served by
+    /// its next connection instead of landing in a receiver nobody holds anymore
+    rx_queue: mpsc::Receiver<InternalMsg<M>>,
+    /// Sending end of [`Self::rx_queue`], declared to the bus while the socket is connected
+    tx_queue: mpsc::Sender<InternalMsg<M>>,
 }
 
-macro_rules! close_socket {
-    ($self:ident, $proc:ident, $socket_id:ident, $msg_queue:ident, $service_name:ident, $return:expr) => {
-        $proc.remove_proc_queue($socket_id as u32).await?;
-        while let Ok(msg) = $msg_queue.try_recv() {
-            if let InternalMsg::Request(req_msg) = msg {
-                let _ = req_msg.return_error_to_sender(
-                    None,
-                    ServiceError::UnableToReachService($service_name.clone()),
-                );
-            }
-        }
-        return $return;
-    };
-}
-
-impl HyperClientSocket {
-    pub fn new(mut target: TargetSetting, http_timeout: u64) -> Self {
-        // Set default protocol to HTTP2 if target enabled SSL
-        if let Some(ssl) = target.ssl.as_mut() {
-            info!(
-                "Target {} enable SSL, set ALPN to support HTTP/2 and HTTP/1.1",
-                target.url
-            );
-            ssl.set_alpn(vec!["h2".into(), "http/1.1".into()]);
-        } else if url_is_ssl(&target.url) {
-            let mut ssl = SslConfig::default();
-            ssl.set_alpn(vec!["h2".into(), "http/1.1".into()]);
-            target.ssl = Some(ssl);
-        }
-
+impl<M> HyperClientSocket<M>
+where
+    M: 'static
+        + std::marker::Send
+        + std::marker::Sync
+        + std::marker::Sized
+        + std::clone::Clone
+        + std::fmt::Debug
+        + prosa::core::msg::Tvf
+        + std::default::Default,
+{
+    /// Create a socket on `target`, which must have been normalized by
+    /// [`HyperClientSettings::normalize_backends`] so it compares equal to the configured backend
+    pub(super) fn new(
+        id: u32,
+        target: TargetSetting,
+        service_name: String,
+        control: watch::Receiver<SocketControl>,
+        rx_queue: mpsc::Receiver<InternalMsg<M>>,
+        tx_queue: mpsc::Sender<InternalMsg<M>>,
+    ) -> Self {
         HyperClientSocket {
+            id,
             target,
-            is_http2: false,
-            http_timeout: Duration::from_millis(http_timeout),
+            service_name,
+            retry: 0,
+            control,
+            rx_queue,
+            tx_queue,
         }
     }
 
-    /// Helper to setup socket queue and service registration
-    async fn setup_socket_queue<M>(
-        proc: &Arc<ProcParam<M>>,
-        socket_id: u32,
-        service_name: &str,
-    ) -> Result<tokio::sync::mpsc::Receiver<InternalMsg<M>>, HyperProcError>
-    where
-        M: 'static
-            + std::marker::Send
-            + std::marker::Sync
-            + std::marker::Sized
-            + std::clone::Clone
-            + std::fmt::Debug
-            + prosa::core::msg::Tvf
-            + std::default::Default,
-    {
-        let (tx_queue, rx_queue) = tokio::sync::mpsc::channel(2048);
-        proc.add_proc_queue(tx_queue, socket_id).await?;
-        proc.add_service(vec![service_name.to_string()], socket_id)
+    /// Bus queue id of the socket, which is the slot it occupies in the pool of the processor
+    pub(super) fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Timeout the processor currently applies to an HTTP message
+    fn http_timeout(&self) -> Duration {
+        self.control.borrow().http_timeout
+    }
+
+    /// Answer `true` once the processor retired the socket.
+    ///
+    /// Reads without marking the value seen, so it never consumes the wake-up [`Self::stopped`] is
+    /// waiting for
+    fn is_stopped(&self) -> bool {
+        self.control.borrow().stopped
+    }
+
+    /// Resolve once the processor retires the socket, and never otherwise.
+    ///
+    /// A dropped sender counts as retired: the processor only ever lets a handle go after it set
+    /// [`SocketControl::stopped`], and a closed channel makes `changed` return instantly forever,
+    /// which as a `select!` arm would spin the socket rather than stop it
+    async fn stopped(control: &mut watch::Receiver<SocketControl>) {
+        while control.changed().await.is_ok() {
+            if control.borrow().stopped {
+                return;
+            }
+        }
+    }
+
+    /// Answer whatever still reaches a socket that won't come back, until nobody can reach it.
+    ///
+    /// The bus is told to remove the queue, but a processor that hasn't received the new service
+    /// table yet still holds it and still sends to it. Closing it there turns a request that should
+    /// have come back `UnableToReachService` into a send error for its sender, and a processor that
+    /// treats that as fatal restarts on it. So the queue outlives the socket, answering rather than
+    /// closing, and only goes away once the last sender did.
+    pub(super) fn retire(self) {
+        let HyperClientSocket {
+            service_name,
+            mut rx_queue,
+            tx_queue,
+            ..
+        } = self;
+
+        // The socket holds a sending end of its own queue, which would keep it open forever
+        drop(tx_queue);
+
+        tokio::spawn(async move {
+            while let Some(msg) = rx_queue.recv().await {
+                if let InternalMsg::Request(req_msg) = msg {
+                    let _ = req_msg.return_error_to_sender(
+                        None,
+                        ServiceError::UnableToReachService(service_name.clone()),
+                    );
+                }
+            }
+        });
+    }
+
+    /// Declare the socket queue and the service it serves to the bus
+    async fn declare_socket_queue(&self, proc: &ProcParam<M>) -> Result<(), HyperProcError> {
+        proc.add_proc_queue(self.tx_queue.clone(), self.id).await?;
+        proc.add_service(vec![self.service_name.clone()], self.id)
             .await?;
-        Ok(rx_queue)
+        Ok(())
+    }
+
+    /// Take the socket queue back off the bus, which also takes the service it advertised.
+    ///
+    /// Reported rather than propagated: a bus that can't be told is no reason to abandon the
+    /// requests the socket still has to answer, and it is the ordinary case while ProSA stops,
+    /// where the main task is already gone
+    async fn withdraw_socket_queue(&self, proc: &ProcParam<M>) {
+        if let Err(e) = proc.remove_proc_queue(self.id).await {
+            debug!(
+                socket_id = self.id,
+                addr = %self.target,
+                "Can't remove the socket queue from the bus: {e}"
+            );
+        }
     }
 
     /// Helper to process a service request into an HTTP request
-    fn process_request<M, A>(
+    fn process_request<A>(
+        &self,
         adaptor: &Arc<A>,
         mut msg: RequestMsg<M>,
-        target_url: &url::Url,
-        service_name: &str,
     ) -> Option<HttpRequestPair<M>>
     where
-        M: 'static
-            + std::marker::Send
-            + std::marker::Sync
-            + std::marker::Sized
-            + std::clone::Clone
-            + std::fmt::Debug
-            + prosa::core::msg::Tvf
-            + std::default::Default,
         A: 'static + HyperClientAdaptor<M> + std::marker::Send + std::marker::Sync,
     {
         if let Some(data) = msg.take_data() {
-            match adaptor.process_srv_request(data, target_url) {
+            match adaptor.process_srv_request(data, &self.target.url) {
                 Ok(http_request) => Some((msg, http_request)),
                 Err(e) => {
                     let _ = msg.return_error_to_sender(None, e);
@@ -138,345 +302,535 @@ impl HyperClientSocket {
         } else {
             let _ = msg.return_error_to_sender(
                 None,
-                ServiceError::UnableToReachService(service_name.to_string()),
+                ServiceError::UnableToReachService(self.service_name.clone()),
             );
             None
         }
     }
 
-    /// Helper to handle handshake timeout errors
-    fn handle_handshake_timeout(
-        socket_id: i32,
-        target_addr: &str,
-        timeout_ms: u64,
+    /// Turn a handshake attempt into the connected pair it yields, reporting what went wrong
+    fn handshake_result<T>(
+        &self,
+        result: Result<Result<T, hyper::Error>, time::error::Elapsed>,
         protocol: &str,
-    ) -> HyperProcError {
-        warn!(
-            socket_id = socket_id,
-            addr = target_addr,
-            "{protocol} handshake timeout after {timeout_ms} ms"
-        );
-        HyperProcError::Io(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("{protocol} handshake timeout after {timeout_ms} ms"),
-        ))
+    ) -> Result<T, HyperProcError> {
+        match result {
+            Ok(Ok(connected)) => Ok(connected),
+            Ok(Err(e)) => {
+                warn!(
+                    socket_id = self.id,
+                    addr = %self.target,
+                    "{protocol} handshake error: {e}"
+                );
+                Err(HyperProcError::Hyper(e, self.target.to_string()))
+            }
+            Err(_) => {
+                let connect_timeout = self.target.connect_timeout;
+                warn!(
+                    socket_id = self.id,
+                    addr = %self.target,
+                    "{protocol} handshake timeout after {connect_timeout} ms"
+                );
+                Err(HyperProcError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{protocol} handshake timeout after {connect_timeout} ms"),
+                )))
+            }
+        }
     }
 
-    /// Helper to handle handshake errors
-    fn handle_handshake_error(
-        socket_id: i32,
-        target_addr: &str,
-        error: hyper::Error,
-        protocol: &str,
-    ) -> HyperProcError {
-        warn!(
-            socket_id = socket_id,
-            addr = target_addr,
-            "{protocol} handshake error: {error}"
-        );
-        HyperProcError::Hyper(error, target_addr.to_string())
-    }
-
-    /// Method to spawn a task that handle the Hyper client socket with HTTP/1.1
-    async fn spawn_http1<M, A>(
-        self,
-        io: TokioIo<Stream>,
-        proc: Arc<ProcParam<M>>,
-        adaptor: Arc<A>,
-        service_name: String,
-        message_histogram: Histogram<u64>,
-    ) -> Result<HyperClientSocket, HyperProcError>
+    /// Send one HTTP/1.1 request and answer its sender, telling whether the socket can carry on and
+    /// whether the backend answered at all.
+    ///
+    /// The message timeout bounds the whole exchange, body included, because a response that is
+    /// only half read leaves the connection where the next one can't be correlated. That is also
+    /// why a timeout ends the socket instead of only failing the request
+    async fn exchange<A>(
+        &self,
+        sender: &mut http1::SendRequest<BoxBody<Bytes, Infallible>>,
+        msg: RequestMsg<M>,
+        request: Request<BoxBody<Bytes, Infallible>>,
+        adaptor: &Arc<A>,
+        message_histogram: &Histogram<u64>,
+    ) -> ControlFlow<(), bool>
     where
-        M: 'static
-            + std::marker::Send
-            + std::marker::Sync
-            + std::marker::Sized
-            + std::clone::Clone
-            + std::fmt::Debug
-            + prosa::core::msg::Tvf
-            + std::default::Default,
         A: 'static + Adaptor + HyperClientAdaptor<M> + std::marker::Send + std::marker::Sync,
     {
-        let socket_id = io.inner().as_raw_fd();
+        let http_timeout = self.http_timeout();
         let target_addr = self.target.to_string();
-        match time::timeout(
-            Duration::from_millis(self.target.connect_timeout),
-            http1::handshake(io),
-        )
-        .await
-        {
-            Ok(Ok((mut sender, mut connection))) => {
-                debug!(
-                    socket_id = socket_id,
-                    addr = target_addr,
-                    "Connected to HTTP1 remote"
-                );
-                let mut rx_queue =
-                    Self::setup_socket_queue(&proc, socket_id as u32, &service_name).await?;
-                debug!(
-                    socket_id = socket_id,
-                    addr = target_addr,
-                    "HTTP client expose service name: {}",
-                    service_name
-                );
-                let mut msg_to_send: Option<HttpRequestPair<M>> = None;
-                let mut req_instant = Instant::now();
+        let http_log = request.uri().to_string();
+        let started = Instant::now();
 
-                loop {
-                    if let Some((msg, http_request)) = msg_to_send.take() {
-                        let http_log = http_request.uri().to_string();
-                        tokio::select! {
-                            // Closed the socket
-                            Err(_) = &mut connection => {
-                                debug!(socket_id = socket_id, addr = target_addr, "Remote HTTP1 close the socket");
-                                close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
+        let exchanged = timeout(http_timeout, async {
+            // Hyper takes the request the moment it is handed over and refuses it until the
+            // connection reported the previous one done, so readiness is asked for, not assumed
+            let response = match sender.ready().await {
+                Ok(()) => sender.send_request(request).await,
+                Err(e) => Err(e),
+            };
+
+            // Whether the backend answered, which is not the same as the adaptor accepting what it
+            // answered: a rejected payload still came over a connection that works
+            let answered = response.is_ok();
+
+            record_message(
+                message_histogram,
+                &target_addr,
+                &response,
+                started,
+                "HTTP/1.1",
+            );
+
+            (answered, adaptor.process_http_response(response).await)
+        })
+        .await;
+
+        match exchanged {
+            Ok((answered, Ok(response))) => {
+                let _ = msg.return_to_sender(response);
+                ControlFlow::Continue(answered)
+            }
+            Ok((answered, Err(e))) => {
+                let _ = msg.return_error_to_sender(None, e);
+                ControlFlow::Continue(answered)
+            }
+            Err(_) => {
+                info!(
+                    socket_id = self.id,
+                    addr = target_addr,
+                    "Message timeout after {} ms: {:?} - {}",
+                    http_timeout.as_millis(),
+                    msg,
+                    http_log
+                );
+                let _ = msg.return_error_to_sender(
+                    None,
+                    ServiceError::Timeout(
+                        self.service_name.clone(),
+                        http_timeout.as_millis() as u64,
+                    ),
+                );
+                ControlFlow::Break(())
+            }
+        }
+    }
+
+    /// Serve the Hyper client socket with HTTP/1.1 until its connection ends, answering whether it
+    /// managed to serve anything on it
+    async fn serve_http1<A>(
+        &mut self,
+        io: TokioIo<Stream>,
+        proc: &ProcParam<M>,
+        adaptor: &Arc<A>,
+        message_histogram: &Histogram<u64>,
+    ) -> Result<bool, HyperProcError>
+    where
+        A: 'static + Adaptor + HyperClientAdaptor<M> + std::marker::Send + std::marker::Sync,
+    {
+        let fd = io.inner().as_raw_fd();
+        let connect_timeout = Duration::from_millis(self.target.connect_timeout);
+
+        // Raced against the shutdown like the connect that produced the stream: it has a budget of
+        // its own, and a socket that has not finished shaking hands holds nothing anyone waits on
+        let handshake = tokio::select! {
+            handshake = time::timeout(connect_timeout, http1::handshake(io)) => handshake,
+            _ = Self::stopped(&mut self.control) => return Ok(true),
+        };
+        let (mut sender, connection) = self.handshake_result(handshake, "HTTP1")?;
+
+        // The connection runs in its own task, which is what lets the loop below await a response
+        // body: Hyper only hands over the bytes it has read, and it only reads while the connection
+        // is polled. Driving it from the loop would stall any body that doesn't arrive with the head
+        let mut connection = tokio::task::spawn(connection);
+
+        debug!(
+            socket_id = self.id,
+            fd = fd,
+            addr = %self.target,
+            "Connected to HTTP1 remote, expose the service {}",
+            self.service_name
+        );
+        self.declare_socket_queue(proc).await?;
+
+        // Whether the backend answered anything on this connection, which is what tells one that is
+        // merely slow from one that accepts and closes without ever serving
+        let mut served = false;
+
+        loop {
+            tokio::select! {
+                // Closed the socket
+                closed = &mut connection => {
+                    debug!(socket_id = self.id, addr = %self.target, "Remote HTTP1 close the socket: {closed:?}");
+                    break;
+                }
+                // The processor retired the socket
+                _ = Self::stopped(&mut self.control) => break,
+                // Receive a message to send from the queue. A retired socket stops taking them, so
+                // the exchange it is in the middle of is the last one it serves: the arms above
+                // are only reached between two of them, never during one
+                Some(msg) = self.rx_queue.recv(), if !self.is_stopped() => {
+                    debug!(socket_id = self.id, addr = %self.target, "HTTP client receive a message to send: {msg:?}");
+                    match msg {
+                        InternalMsg::Request(req_msg) => {
+                            let Some((msg, request)) = self.process_request(adaptor, req_msg) else {
+                                continue;
+                            };
+
+                            // HTTP/1.1 correlates by order, so the exchange is awaited here and
+                            // nothing else goes out until it is answered
+                            match self.exchange(&mut sender, msg, request, adaptor, message_histogram).await {
+                                ControlFlow::Continue(answered) => served |= answered,
+                                ControlFlow::Break(()) => break,
                             }
-                            // Send an HTTP request
-                            response_sent = timeout(self.http_timeout, sender.send_request(http_request)) => {
-                                match response_sent {
-                                    Ok(response) => {
-                                        let (code, version) = response.as_ref().map_or((500, "HTTP/1"), |r| (r.status().as_u16() as i64, hyper_version_str(r.version())));
-                                        message_histogram.record(
-                                            req_instant.elapsed().as_millis() as u64,
-                                            &[
-                                                KeyValue::new("target", target_addr.clone()),
-                                                KeyValue::new("code", code),
-                                                KeyValue::new("version", version),
-                                            ],
-                                        );
+                        },
+                        InternalMsg::Response(msg) => panic!(
+                            "The HTTP1 hyper client socket {}/{} receive a response {:?}",
+                            proc.get_proc_id(),
+                            self.id,
+                            msg
+                        ),
+                        InternalMsg::Error(err_msg) => panic!(
+                            "The HTTP1 hyper client socket {}/{} receive an error {:?}",
+                            proc.get_proc_id(),
+                            self.id,
+                            err_msg
+                        ),
+                        // The processor is the one that reads the service table and the
+                        // configuration, and tells its sockets what came out of it
+                        InternalMsg::Service(_) | InternalMsg::Config(_) => {},
+                        // The main task shutting ProSA down
+                        InternalMsg::Shutdown => break,
+                    }
+                }
+            }
+        }
 
-                                        match adaptor.process_http_response(response).await {
-                                            Ok(r) => {
-                                                let _ = msg.return_to_sender(r);
-                                            },
-                                            Err(e) => {
-                                                let _ = msg.return_error_to_sender(None, e);
-                                            }
-                                        }
-                                    },
-                                    Err(elapsed) => {
-                                        info!(socket_id = socket_id, addr = target_addr, "Message timeout after {} ms: {:?} - {}", elapsed, msg, http_log);
-                                        let _ = msg.return_error_to_sender(None, ServiceError::Timeout(service_name.clone(), self.http_timeout.as_millis() as u64));
-                                        // Need to drop the connection because it's HTTP1
-                                        close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
-                                    },
+        // What is left in the queue is served by the next connection of the socket, or answered by
+        // the processor if it doesn't restart it
+        self.withdraw_socket_queue(proc).await;
+
+        Ok(served)
+    }
+
+    /// Let the requests already sent on an HTTP/2 socket finish before the socket goes away.
+    ///
+    /// They run in their own task and hold a sender of the connection, which keeps its task alive
+    /// for as long as they need it, so waiting is all there is to do. Bounded by the message
+    /// timeout, past which they are detached rather than aborted, because an aborted task never
+    /// answers the sender of the request it carries
+    async fn drain_requests(&self, requests: &mut JoinSet<()>) {
+        if requests.is_empty() {
+            return;
+        }
+
+        debug!(
+            socket_id = self.id,
+            addr = %self.target,
+            "Wait for {} in flight request(s) before closing the socket",
+            requests.len()
+        );
+
+        let drained = timeout(self.http_timeout(), async {
+            while let Some(request) = requests.join_next().await {
+                if let Err(e) = request {
+                    warn!(
+                        socket_id = self.id,
+                        addr = %self.target,
+                        "An HTTP2 request task panicked, its sender won't be answered: {e}"
+                    );
+                }
+            }
+        })
+        .await;
+
+        if drained.is_err() {
+            warn!(
+                socket_id = self.id,
+                addr = %self.target,
+                "Close the socket with {} request(s) still in flight",
+                requests.len()
+            );
+
+            requests.detach_all();
+        }
+    }
+
+    /// Serve the Hyper client socket with HTTP/2 until its connection ends, answering whether it
+    /// managed to serve anything on it
+    async fn serve_h2<A>(
+        &mut self,
+        io: TokioIo<Stream>,
+        proc: &ProcParam<M>,
+        adaptor: &Arc<A>,
+        message_histogram: &Histogram<u64>,
+    ) -> Result<bool, HyperProcError>
+    where
+        A: 'static + Adaptor + HyperClientAdaptor<M> + std::marker::Send + std::marker::Sync,
+    {
+        let fd = io.inner().as_raw_fd();
+        let connect_timeout = Duration::from_millis(self.target.connect_timeout);
+
+        // Raced against the shutdown like the connect that produced the stream: it has a budget of
+        // its own, and a socket that has not finished shaking hands holds nothing anyone waits on
+        let handshake = tokio::select! {
+            handshake = time::timeout(connect_timeout, http2::handshake(TokioExecutor::new(), io)) => handshake,
+            _ = Self::stopped(&mut self.control) => return Ok(true),
+        };
+        let (sender, connection) = self.handshake_result(handshake, "HTTP2")?;
+
+        // The connection runs in its own task, so it keeps serving the requests below, which read
+        // their response body long after the loop moved on, and outlives this method for the ones
+        // that are still draining
+        let mut connection = tokio::task::spawn(connection);
+
+        debug!(
+            socket_id = self.id,
+            fd = fd,
+            addr = %self.target,
+            "Connected to HTTP2 remote, expose the service {}",
+            self.service_name
+        );
+        self.declare_socket_queue(proc).await?;
+
+        // Requests are multiplexed on the connection, each one running in its own task. Tracked so
+        // they can be drained when the socket closes
+        let mut requests = JoinSet::new();
+
+        // Whether the backend answered anything on this connection, which is what tells one that is
+        // merely slow from one that accepts and closes without ever serving. Shared with the
+        // request tasks, so an answer counts as long as its task was joined: one detached by
+        // `drain_requests` stores it after this has been read, and is lost. That only happens after
+        // a whole message timeout of waiting, by which point the connection lasted long enough to
+        // count on its own
+        let served = Arc::new(AtomicBool::new(false));
+
+        loop {
+            tokio::select! {
+                // Closed the socket
+                closed = &mut connection => {
+                    debug!(socket_id = self.id, addr = %self.target, "Remote HTTP2 close the socket: {closed:?}");
+                    break;
+                }
+                // The processor retired the socket
+                _ = Self::stopped(&mut self.control) => break,
+                // Reap the requests that are done, so the set doesn't grow with the socket. A task
+                // that panicked took the request it held with it, which nothing can answer anymore,
+                // so the least it can do is not be silent about it
+                Some(request) = requests.join_next(), if !requests.is_empty() => {
+                    if let Err(e) = request {
+                        warn!(socket_id = self.id, addr = %self.target, "An HTTP2 request task panicked, its sender won't be answered: {e}");
+                    }
+                },
+                // Receive a message to send from the queue. A retired socket stops taking them and
+                // drains the ones it multiplexed rather than starting another
+                Some(msg) = self.rx_queue.recv(), if !self.is_stopped() => {
+                    match msg {
+                        InternalMsg::Request(mut req_msg) => {
+                            let Some(data) = req_msg.take_data() else {
+                                let _ = req_msg.return_error_to_sender(None, ServiceError::UnableToReachService(self.service_name.clone()));
+                                continue;
+                            };
+
+                            let started = Instant::now();
+                            let mut sender = sender.clone();
+                            let adaptor = adaptor.clone();
+                            let target_url = self.target.url.clone();
+                            let target_addr = self.target.to_string();
+                            let message_histogram = message_histogram.clone();
+                            let http_timeout = self.http_timeout();
+                            let service_name = self.service_name.clone();
+                            let served = served.clone();
+
+                            requests.spawn(async move {
+                                let request = match adaptor.process_srv_request(data, &target_url) {
+                                    Ok(request) => request,
+                                    Err(e) => {
+                                        let _ = req_msg.return_error_to_sender(None, e);
+                                        return;
+                                    }
                                 };
-                            }
-                        }
-                    } else {
-                        tokio::select! {
-                            // Closed the socket
-                            Err(_) = &mut connection => {
-                                debug!(socket_id = socket_id, addr = target_addr, "Remote close the socket");
-                                close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
-                            }
-                            // Receive a message to send from the queue
-                            Some(msg) = rx_queue.recv() => {
-                                debug!(socket_id = socket_id, addr = target_addr, "HTTP client receive a message to send: {:?}", msg);
-                                match msg {
-                                    InternalMsg::Request(req_msg) => {
-                                        if let Some(result) = Self::process_request(&adaptor, req_msg, &self.target.url, &service_name) {
-                                            msg_to_send = Some(result);
-                                            req_instant = Instant::now();
-                                        }
-                                    },
-                                    InternalMsg::Response(msg) => panic!(
-                                        "The HTTP1 hyper client socket {}/{socket_id} receive a response {:?}",
-                                        proc.get_proc_id(),
-                                        msg
-                                    ),
-                                    InternalMsg::Error(err_msg) => panic!(
-                                        "The HTTP1 hyper client socket {}/{socket_id} receive an error {:?}",
-                                        proc.get_proc_id(),
-                                        err_msg
-                                    ),
-                                    InternalMsg::Command(_) | InternalMsg::Config => {
-                                        // TODO: Implement Command/Config handling or document as unsupported
-                                    },
-                                    InternalMsg::Service(_table) => {/* Will not use service table */},
-                                    InternalMsg::Shutdown => {
-                                        // Remove the socket queue and wait message to finish
-                                        close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
+
+                                let answered = timeout(http_timeout, async {
+                                    let response = sender.send_request(request).await;
+                                    if response.is_ok() {
+                                        served.store(true, Ordering::Relaxed);
                                     }
+                                    record_message(&message_histogram, &target_addr, &response, started, "HTTP/2");
+                                    adaptor.process_http_response(response).await
+                                })
+                                .await;
+
+                                match answered {
+                                    Ok(Ok(response)) => { let _ = req_msg.return_to_sender(response); },
+                                    Ok(Err(e)) => { let _ = req_msg.return_error_to_sender(None, e); },
+                                    Err(_) => { let _ = req_msg.return_error_to_sender(None, ServiceError::Timeout(service_name, http_timeout.as_millis() as u64)); },
                                 }
-                            }
-                        }
+                            });
+                        },
+                        InternalMsg::Response(msg) => panic!(
+                            "The H2 hyper client socket {}/{} receive a response {:?}",
+                            proc.get_proc_id(),
+                            self.id,
+                            msg
+                        ),
+                        InternalMsg::Error(err_msg) => panic!(
+                            "The H2 hyper client socket {}/{} receive an error {:?}",
+                            proc.get_proc_id(),
+                            self.id,
+                            err_msg
+                        ),
+                        // The processor is the one that reads the service table and the
+                        // configuration, and tells its sockets what came out of it
+                        InternalMsg::Service(_) | InternalMsg::Config(_) => {},
+                        // The main task shutting ProSA down
+                        InternalMsg::Shutdown => break,
                     }
                 }
             }
-            Ok(Err(e)) => Err(Self::handle_handshake_error(
-                socket_id,
-                &target_addr,
-                e,
-                "HTTP1",
-            )),
-            Err(_) => Err(Self::handle_handshake_timeout(
-                socket_id,
-                &target_addr,
-                self.target.connect_timeout,
-                "HTTP1",
-            )),
         }
+
+        // Stop taking new requests before draining the ones already sent, which must happen even if
+        // the bus couldn't be told: dropping the set here would abort them unanswered
+        self.withdraw_socket_queue(proc).await;
+        self.drain_requests(&mut requests).await;
+
+        Ok(served.load(Ordering::Relaxed))
     }
 
-    /// Method to spawn a task that handle the Hyper client socket with HTTP/2
-    async fn spawn_h2<M, A>(
-        mut self,
-        io: TokioIo<Stream>,
-        proc: Arc<ProcParam<M>>,
-        adaptor: Arc<A>,
-        service_name: String,
-        message_histogram: Histogram<u64>,
-    ) -> Result<HyperClientSocket, HyperProcError>
+    /// Connect the socket and serve it until it closes, answering whether the connection worked.
+    ///
+    /// A connection that served something did its job, and so did one that merely stayed open long
+    /// enough: an idle keep-alive close is healthy, and a socket that backed off from those would
+    /// leave a quiet pool disconnected. What is left is a backend that accepts and closes right
+    /// away, which is indistinguishable from one that refuses and has to be backed off the same way
+    async fn connect<A>(
+        &mut self,
+        proc: &ProcParam<M>,
+        adaptor: &Arc<A>,
+        meters: &SocketMeters,
+        healthy_connection: Duration,
+    ) -> Result<bool, HyperProcError>
     where
-        M: 'static
-            + std::marker::Send
-            + std::marker::Sync
-            + std::marker::Sized
-            + std::clone::Clone
-            + std::fmt::Debug
-            + prosa::core::msg::Tvf
-            + std::default::Default,
         A: 'static + Adaptor + HyperClientAdaptor<M> + std::marker::Send + std::marker::Sync,
     {
-        let socket_id = io.inner().as_raw_fd();
-        let target_addr = self.target.to_string();
-        self.is_http2 = true;
-        match time::timeout(
-            Duration::from_millis(self.target.connect_timeout),
-            http2::handshake(TokioExecutor::new(), io),
-        )
-        .await
-        {
-            Ok(Ok((sender, mut connection))) => {
-                debug!(
-                    socket_id = socket_id,
-                    addr = target_addr,
-                    "Connected to HTTP2 remote"
-                );
-                let mut rx_queue =
-                    Self::setup_socket_queue(&proc, socket_id as u32, &service_name).await?;
+        // Picked up here rather than at spawn, so a reload that only changes it applies to the next
+        // attempt instead of retiring a socket that is connecting perfectly well
+        self.target.connect_timeout = self.control.borrow().connect_timeout;
 
-                loop {
-                    tokio::select! {
-                        // Closed the socket
-                        Err(_) = &mut connection => {
-                            debug!(socket_id = socket_id, addr = target_addr, "Remote HTTP2 close the socket");
-                            close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
+        // Connecting is the one thing a socket does that its bus queue can't interrupt, and it can
+        // take two `connect_timeout` with the handshake below, so the shutdown is raced against it
+        let stream = tokio::select! {
+            stream = self.target.connect() => stream?,
+            _ = Self::stopped(&mut self.control) => return Ok(true),
+        };
+
+        let io = TokioIo::new(stream);
+        let is_http2 = io.inner().selected_alpn_check(|alpn| alpn == H2);
+
+        // Counted here rather than in the processor, which only knows the sockets it wants to
+        // exist. This reports the ones that are really connected, so a backend that is down or
+        // flapping shows up as its counter dropping
+        let socket_attributes = [
+            KeyValue::new("target", self.target.to_string()),
+            KeyValue::new("version", if is_http2 { "HTTP/2" } else { "HTTP/1.1" }),
+        ];
+        meters.socket_counter.add(1, &socket_attributes);
+
+        let connected_at = Instant::now();
+        let result = if is_http2 {
+            self.serve_h2(io, proc, adaptor, &meters.message_histogram)
+                .await
+        } else {
+            self.serve_http1(io, proc, adaptor, &meters.message_histogram)
+                .await
+        };
+
+        meters.socket_counter.add(-1, &socket_attributes);
+        result.map(|served| served || connected_at.elapsed() >= healthy_connection)
+    }
+
+    /// Wait `reconnect_delay` out before connecting again, serving the queue in the meantime.
+    ///
+    /// The socket has no bus queue while it isn't connected, so nothing should reach it here, but a
+    /// processor holding an older service table still can. Answering rather than letting a request
+    /// sit in the queue is what keeps its sender from waiting on a backend that is down.
+    ///
+    /// Break when the socket was asked to stop, which the processor does here too: a socket that is
+    /// only waiting to reconnect is unknown to the main task
+    async fn wait_reconnect(&mut self, reconnect_delay: Duration) -> ControlFlow<()> {
+        if reconnect_delay.is_zero() {
+            return ControlFlow::Continue(());
+        }
+
+        debug!(
+            socket_id = self.id,
+            addr = %self.target,
+            "Reconnect the socket in {reconnect_delay:?}"
+        );
+
+        let sleep = time::sleep(reconnect_delay);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => return ControlFlow::Continue(()),
+                _ = Self::stopped(&mut self.control) => return ControlFlow::Break(()),
+                Some(msg) = self.rx_queue.recv() => {
+                    match msg {
+                        InternalMsg::Request(req_msg) => {
+                            let _ = req_msg.return_error_to_sender(
+                                None,
+                                ServiceError::UnableToReachService(self.service_name.clone()),
+                            );
                         }
-                        // Receive a message to send from the queue
-                        Some(msg) = rx_queue.recv() => {
-                            match msg {
-                                InternalMsg::Request(mut req_msg) => {
-                                    if let Some(data) = req_msg.take_data() {
-                                        let req_instant = Instant::now();
-                                        let mut sender = sender.clone();
-                                        let adaptor = adaptor.clone();
-                                        let target_url = self.target.url.clone();
-                                        let message_histogram = message_histogram.clone();
-                                        let http_timeout = self.http_timeout;
-                                        let service_name_clone = service_name.clone();
-
-                                        tokio::spawn(async move {
-                                            match adaptor.process_srv_request(data, &target_url) {
-                                                Ok(http_request) => {
-                                                    match timeout(http_timeout, sender.send_request(http_request)).await {
-                                                        Ok(http_response) => {
-                                                            let (code, version) = http_response.as_ref().map_or((500, "HTTP/2"), |r| (r.status().as_u16() as i64, hyper_version_str(r.version())));
-                                                            message_histogram.record(
-                                                                req_instant.elapsed().as_millis() as u64,
-                                                                &[
-                                                                    KeyValue::new("target", target_url.to_string()),
-                                                                    KeyValue::new("code", code),
-                                                                    KeyValue::new("version", version),
-                                                                ],
-                                                            );
-
-                                                            match adaptor.process_http_response(http_response).await {
-                                                                Ok(response) => {
-                                                                    let _ = req_msg.return_to_sender(response);
-                                                                },
-                                                                Err(e) => { let _ = req_msg.return_error_to_sender(None, e); },
-                                                            }
-                                                        },
-                                                        Err(_) => { let _ = req_msg.return_error_to_sender(None, ServiceError::Timeout(service_name_clone, http_timeout.as_millis() as u64)); },
-                                                    };
-                                                },
-                                                Err(e) => {
-                                                    let _ = req_msg.return_error_to_sender(None, e);
-                                                },
-                                            }
-                                        });
-                                    } else {
-                                        let _ = req_msg.return_error_to_sender(None, ServiceError::UnableToReachService(service_name.clone()));
-                                    }
-                                },
-                                InternalMsg::Response(msg) => panic!(
-                                    "The H2 hyper client socket {}/{socket_id} receive a response {:?}",
-                                    proc.get_proc_id(),
-                                    msg
-                                ),
-                                InternalMsg::Error(err_msg) => panic!(
-                                    "The H2 hyper client socket {}/{socket_id} receive an error {:?}",
-                                    proc.get_proc_id(),
-                                    err_msg
-                                ),
-                                InternalMsg::Command(_) | InternalMsg::Config => {
-                                    // TODO: Implement Command/Config handling or document as unsupported
-                                },
-                                InternalMsg::Service(_table) => {/* Will not use service table */},
-                                InternalMsg::Shutdown => {
-                                    // Remove the socket queue and wait message to finish
-                                    close_socket!(self, proc, socket_id, rx_queue, service_name, Ok(self));
-                                }
-                            }
-                        }
+                        InternalMsg::Shutdown => return ControlFlow::Break(()),
+                        _ => {}
                     }
                 }
             }
-            Ok(Err(e)) => Err(Self::handle_handshake_error(
-                socket_id,
-                &target_addr,
-                e,
-                "HTTP2",
-            )),
-            Err(_) => Err(Self::handle_handshake_timeout(
-                socket_id,
-                &target_addr,
-                self.target.connect_timeout,
-                "HTTP2",
-            )),
         }
     }
 
-    /// Method to spawn a task to handle the Hyper client socket
-    pub fn spawn<M, A>(
-        self,
-        join_set: &mut JoinSet<Result<Self, HyperProcError>>,
+    /// Method to spawn a task to handle the Hyper client socket, answering the task it runs in.
+    ///
+    /// The task always gives the socket back to the processor, even when it never managed to
+    /// connect, so a backend that is down doesn't silently shrink the pool. The processor is the
+    /// only one that decides whether to restart it, and the task id is how it finds the slot again
+    /// if the task panicked instead of returning
+    pub(super) fn spawn<A>(
+        mut self,
+        join_set: &mut JoinSet<(Self, Option<HyperProcError>)>,
         proc: Arc<ProcParam<M>>,
         adaptor: Arc<A>,
-        service_name: String,
-        message_histogram: Histogram<u64>,
-    ) where
-        M: 'static
-            + std::marker::Send
-            + std::marker::Sync
-            + std::marker::Sized
-            + std::clone::Clone
-            + std::fmt::Debug
-            + prosa::core::msg::Tvf
-            + std::default::Default,
+        settings: &HyperClientSettings,
+        meters: SocketMeters,
+    ) -> tokio::task::Id
+    where
         A: 'static + Adaptor + HyperClientAdaptor<M> + std::marker::Send + std::marker::Sync,
     {
-        join_set.spawn(async move {
-            let io = TokioIo::new(self.target.connect().await?);
-            if io.inner().selected_alpn_check(|alpn| alpn == H2) {
-                self.spawn_h2::<M, A>(io, proc, adaptor, service_name, message_histogram)
-                    .await
-            } else {
-                self.spawn_http1::<M, A>(io, proc, adaptor, service_name, message_histogram)
-                    .await
-            }
-        });
+        let reconnect_delay = settings.reconnect_delay(self.retry);
+        let healthy_connection = settings.base_reconnect_delay();
+
+        join_set
+            .spawn(async move {
+                if self.is_stopped() || self.wait_reconnect(reconnect_delay).await.is_break() {
+                    return (self, None);
+                }
+
+                let connected = self
+                    .connect(&proc, &adaptor, &meters, healthy_connection)
+                    .await;
+
+                // Back off from a backend the socket couldn't get a working connection out of, whether
+                // it refused one or gave one it closed straight away. Both look the same to a caller,
+                // and reconnecting either without waiting is a loop at the speed of the machine
+                self.retry = if matches!(connected, Ok(true)) {
+                    0
+                } else {
+                    self.retry.saturating_add(1)
+                };
+
+                (self, connected.err())
+            })
+            .id()
     }
 }
