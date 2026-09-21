@@ -165,59 +165,59 @@ where
                             }
                         }
                         InternalMsg::Service(table) => self.service = table,
-                        InternalMsg::Config(config) => {
-                            // A reload landing while the processor drains would bind a listener it will never accept from
-                            if let Some(mut settings) = graceful.is_some()
-                                .then(|| config.reload_proc::<HyperServerSettings>(self.proc.as_ref(), adaptor.as_ref()))
-                                .flatten()
-                            {
-                                // Normalize the ALPN as done at startup before comparing
-                                settings.listener.set_alpn(vec!["h2".into(), "http/1.1".into()]);
+                        // A reload landing while the processor drains would bind a listener it will never accept from
+                        InternalMsg::Config(config) => if graceful.is_some() {
+                            match config.reload_proc::<HyperServerSettings>(self.proc.as_ref(), adaptor.as_ref()) {
+                                Ok(mut settings) => {
+                                    // Normalize the ALPN as done at startup before comparing
+                                    settings.listener.set_alpn(vec!["h2".into(), "http/1.1".into()]);
 
-                                // Only listening somewhere else needs a new socket. Turning SSL on,
-                                // off, or rotating a certificate is served on the socket that is
-                                // already bound, by the handshaker rebuilt below
-                                if self.settings.listener.needs_rebind(&settings.listener) {
-                                    match settings.listener.bind_raw().await {
-                                        Ok((new_listener, new_handshaker)) => {
-                                            let local_addr = new_listener.local_addr();
-                                            handshaker = new_handshaker;
-                                            listener = Some(Arc::new(new_listener));
-                                            match local_addr {
-                                                Ok(addr) => info!("Reload the Hyper server processor configuration, listening on {addr}"),
-                                                Err(e) => info!("Reload the Hyper server processor configuration, can't read the address it bound: {e}"),
+                                    // Only listening somewhere else needs a new socket. Turning SSL on,
+                                    // off, or rotating a certificate is served on the socket that is
+                                    // already bound, by the handshaker rebuilt below
+                                    if self.settings.listener.needs_rebind(&settings.listener) {
+                                        match settings.listener.bind_raw().await {
+                                            Ok((new_listener, new_handshaker)) => {
+                                                let local_addr = new_listener.local_addr();
+                                                handshaker = new_handshaker;
+                                                listener = Some(Arc::new(new_listener));
+                                                match local_addr {
+                                                    Ok(addr) => info!("Reload the Hyper server processor configuration, listening on {addr}"),
+                                                    Err(e) => info!("Reload the Hyper server processor configuration, can't read the address it bound: {e}"),
+                                                }
+                                            }
+                                            // An address the processor can't bind is no reason to lose the
+                                            // one it serves on, so keep the listener and the settings that describe it
+                                            Err(e) => {
+                                                warn!("Can't listen on {}, keep the previous address: {e}", settings.listener.get_safe_url());
+                                                settings.listener = self.settings.listener.clone();
                                             }
                                         }
-                                        // An address the processor can't bind is no reason to lose the
-                                        // one it serves on, so keep the listener and the settings that describe it
-                                        Err(e) => {
-                                            warn!("Can't listen on {}, keep the previous address: {e}", settings.listener.get_safe_url());
-                                            settings.listener = self.settings.listener.clone();
+                                    } else {
+                                        // Built again whatever the configuration says, because it holds
+                                        // the path of the certificate and not the certificate: a renewal
+                                        // that rewrites the file in place leaves the two configurations
+                                        // equal, so comparing them would skip exactly the reload this is
+                                        // for. One file read, and neither the socket nor an established
+                                        // connection is touched
+                                        match settings.listener.build_handshaker().await {
+                                            Ok(new_handshaker) => {
+                                                handshaker = new_handshaker;
+                                                info!("Reload the Hyper server processor configuration, serving {}", settings.listener.get_safe_url());
+                                            }
+                                            // The processor keeps serving the certificate it has, so the
+                                            // settings have to keep describing it
+                                            Err(e) => {
+                                                warn!("Can't serve the certificate of {}, keep the previous one: {e}", settings.listener.get_safe_url());
+                                                settings.listener = self.settings.listener.clone();
+                                            }
                                         }
                                     }
-                                } else {
-                                    // Built again whatever the configuration says, because it holds
-                                    // the path of the certificate and not the certificate: a renewal
-                                    // that rewrites the file in place leaves the two configurations
-                                    // equal, so comparing them would skip exactly the reload this is
-                                    // for. One file read, and neither the socket nor an established
-                                    // connection is touched
-                                    match settings.listener.build_handshaker().await {
-                                        Ok(new_handshaker) => {
-                                            handshaker = new_handshaker;
-                                            info!("Reload the Hyper server processor configuration, serving {}", settings.listener.get_safe_url());
-                                        }
-                                        // The processor keeps serving the certificate it has, so the
-                                        // settings have to keep describing it
-                                        Err(e) => {
-                                            warn!("Can't serve the certificate of {}, keep the previous one: {e}", settings.listener.get_safe_url());
-                                            settings.listener = self.settings.listener.clone();
-                                        }
-                                    }
-                                }
 
-                                // The service timeout is picked up by the next request
-                                self.settings = settings;
+                                    // The service timeout is picked up by the next request
+                                    self.settings = settings;
+                                }
+                                Err(e) => warn!("Failed to reload configuration for processor {}: {e}", self.name()),
                             }
                         }
                         InternalMsg::Shutdown => {

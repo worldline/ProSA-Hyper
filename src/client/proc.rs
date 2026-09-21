@@ -482,19 +482,22 @@ where
                             // Read here and only here, so `Adaptor::reload_config` runs once. What
                             // came out of it reaches the sockets through their control channel,
                             // which gets to one that is busy serving where its bus queue wouldn't
-                            if let Some(mut settings) = config.reload_proc::<HyperClientSettings>(self.proc.as_ref(), adaptor.as_ref()) {
-                                // Keep the current configuration, a client without backend can't
-                                // serve anything
-                                if settings.backends.is_empty() {
-                                    warn!("Ignoring the configuration reload of {}: no backend configured", self.name());
-                                    continue;
+                            match config.reload_proc::<HyperClientSettings>(self.proc.as_ref(), adaptor.as_ref()) {
+                                Ok(mut settings) => {
+                                    // Keep the current configuration, a client without backend can't
+                                    // serve anything
+                                    if settings.backends.is_empty() {
+                                        warn!("Ignoring the configuration reload of {}: no backend configured", self.name());
+                                        continue;
+                                    }
+
+                                    info!("Reload the configuration of the Hyper client processor {}", self.name());
+
+                                    settings.normalize_backends();
+                                    self.settings = settings;
+                                    pool.align(&self.settings, &self.proc, &adaptor);
                                 }
-
-                                info!("Reload the configuration of the Hyper client processor {}", self.name());
-
-                                settings.normalize_backends();
-                                self.settings = settings;
-                                pool.align(&self.settings, &self.proc, &adaptor);
+                                Err(e) => warn!("Failed to reload configuration for processor {}: {e}", self.name()),
                             }
                         }
                         InternalMsg::Shutdown => {
