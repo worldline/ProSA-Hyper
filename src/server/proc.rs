@@ -1,8 +1,8 @@
-use std::{env, sync::Arc, time::Duration};
+use std::{env, io, sync::Arc, time::Duration};
 
 use hyper::server::conn::{http1, http2};
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::graceful::GracefulShutdown,
 };
 use prosa::{
@@ -38,6 +38,10 @@ pub struct HyperServerSettings {
     /// Timeout for internal service requests
     #[serde(default = "HyperServerSettings::default_service_timeout")]
     pub service_timeout: Duration,
+    /// Time an HTTP/1.1 client is given to send its request headers, in milliseconds.
+    /// Zero disables it
+    #[serde(default = "HyperServerSettings::default_header_read_timeout")]
+    pub header_read_timeout: u64,
 }
 
 impl HyperServerSettings {
@@ -56,6 +60,19 @@ impl HyperServerSettings {
         Duration::from_millis(800)
     }
 
+    fn default_header_read_timeout() -> u64 {
+        30000
+    }
+
+    /// Time an HTTP/1.1 client is given to send its request headers, [`None`] when it is disabled.
+    ///
+    /// A connection that sends half a request line and stops holds a task of its own, and a worker
+    /// of the graceful shutdown, for as long as it likes. Only HTTP/1.1 has it: HTTP/2 carries the
+    /// headers in frames the connection already bounds
+    pub(crate) fn header_read_timeout(&self) -> Option<Duration> {
+        (self.header_read_timeout > 0).then(|| Duration::from_millis(self.header_read_timeout))
+    }
+
     /// Create a new Hyper Server settings
     pub fn new(listener: ListenerSetting, service_timeout: Duration) -> HyperServerSettings {
         HyperServerSettings {
@@ -72,8 +89,34 @@ impl Default for HyperServerSettings {
         HyperServerSettings {
             listener: Self::default_listener(),
             service_timeout: Self::default_service_timeout(),
+            header_read_timeout: Self::default_header_read_timeout(),
         }
     }
+}
+
+/// How long the accept loop waits after an error that isn't about the client it was accepting.
+///
+/// Short enough that a momentary shortage of file descriptors costs a few connections, long enough
+/// that the loop doesn't spin while it lasts
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Method to know if an accept error concerns only the client that was being accepted, so the next
+/// accept is unaffected and the loop can go straight back to it.
+///
+/// Nothing else is fatal either: an accept error is never a reason to drop the connections the
+/// processor is already serving. The rest is retried after [`ACCEPT_RETRY_DELAY`], because the ones
+/// that aren't about a client — running out of file descriptors, above all — leave the connection
+/// in the backlog and would be returned again immediately. Those have no
+/// [`std::io::ErrorKind`](io::ErrorKind) of their own on stable Rust, which is the other reason
+/// they can't be named here
+fn accept_is_per_client(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+    )
 }
 
 /// Hyper server processor
@@ -153,10 +196,19 @@ where
                             msg
                         ),
                         InternalMsg::Response(mut msg) => {
-                            if let Some(hyper_msg) = pending_req.pull_msg(msg.get_id())
-                                && let Some(data) = msg.take_data()
-                            {
-                                let _ = hyper_msg.return_to_sender(data);
+                            if let Some(hyper_msg) = pending_req.pull_msg(msg.get_id()) {
+                                match msg.take_data() {
+                                    Some(data) => { let _ = hyper_msg.return_to_sender(data); }
+                                    // The request is out of the pending list, so nothing else will
+                                    // answer it. A response that carries nothing can't be turned
+                                    // into an HTTP one, and saying so now is better than letting
+                                    // the client wait out the service timeout for a service that
+                                    // did answer
+                                    None => {
+                                        let service_name = hyper_msg.get_service().clone();
+                                        let _ = hyper_msg.return_error_to_sender(None, ServiceError::ProtocolError(service_name));
+                                    }
+                                }
                             }
                         }
                         InternalMsg::Error(mut err_msg) => {
@@ -267,7 +319,22 @@ where
                         None => None,
                     }
                 }, if accept_listener.is_some() => {
-                    let (stream, addr) = accept_result?;
+                    let (stream, addr) = match accept_result {
+                        Ok(accepted) => accepted,
+                        Err(e) => {
+                            if accept_is_per_client(&e) {
+                                debug!("Lost a client before it was accepted: {e}");
+                            } else {
+                                // Out of file descriptors and the like. The connection stays in the
+                                // backlog and the listener stays readable, so accepting again right
+                                // away would spin on the same error at the speed of the machine
+                                warn!("Can't accept a client, retrying in {} ms: {e}", ACCEPT_RETRY_DELAY.as_millis());
+                                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                            }
+
+                            continue;
+                        }
+                    };
 
                     // The watcher is taken before the connection is spawned, so a shutdown asked
                     // in between is not missed
@@ -278,6 +345,7 @@ where
                     // Owned snapshot of the SSL parameters, so a rotation doesn't wait for the
                     // handshake and the client is served the certificate of its accept
                     let handshaker = handshaker.clone();
+                    let header_read_timeout = self.settings.header_read_timeout();
                     let service_adaptor = adaptor.clone();
                     let http_tx = http_tx.clone();
                     let http_counter = observable_http_counter.clone();
@@ -307,10 +375,13 @@ where
                                         warn!("Failed to serve http/2 connection[{addr}]: {err:?}");
                                     }
                                 } else if let Err(err) = watcher.watch(
-                                    http1::Builder::new().serve_connection(
-                                        io,
-                                        service,
-                                    )
+                                    http1::Builder::new()
+                                        .timer(TokioTimer::new())
+                                        .header_read_timeout(header_read_timeout)
+                                        .serve_connection(
+                                            io,
+                                            service,
+                                        )
                                 ).await
                                 {
                                     warn!("Failed to serve http/1 connection[{addr}]: {err:?}");
@@ -351,5 +422,33 @@ where
         warn!("The Hyper server processor is shut down");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_client_being_accepted_is_retried_at_once() {
+        // A client that went away between the SYN and the accept, and a syscall a signal
+        // interrupted: the connection is out of the backlog, so the next accept makes progress
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::Interrupted,
+        ] {
+            assert!(
+                accept_is_per_client(&io::Error::from(kind)),
+                "{kind:?} concerns only the client being accepted"
+            );
+        }
+
+        // Running out of file descriptors has no `ErrorKind` of its own, so it arrives
+        // uncategorized and has to be the case that waits
+        assert!(!accept_is_per_client(&io::Error::from_raw_os_error(24)));
+        assert!(!accept_is_per_client(&io::Error::from_raw_os_error(23)));
+        assert!(!accept_is_per_client(&io::Error::other("broken listener")));
     }
 }

@@ -112,20 +112,35 @@ impl SocketControl {
     }
 }
 
+/// Status and protocol of an exchange, [`None`] when the backend answered neither
+type MessageOutcome = Option<(i64, &'static str)>;
+
+/// Read what an exchange has to report, before the response is handed over for its body to be
+/// collected
+fn message_outcome(response: &Result<Response<Incoming>, hyper::Error>) -> MessageOutcome {
+    response
+        .as_ref()
+        .ok()
+        .map(|r| (r.status().as_u16() as i64, hyper_version_str(r.version())))
+}
+
 /// Report the duration of a message under the backend it was sent to.
 ///
 /// The target is formatted rather than taken from the URL, so a backend configured with credentials
-/// doesn't put them in a metric attribute, and both protocols report under the same value
+/// doesn't put them in a metric attribute, and both protocols report under the same value.
+///
+/// An exchange that produced no response, because the transport failed or because it timed out, is
+/// reported as code 0: a 500 would make a backend that resets its connections indistinguishable
+/// from one answering 500. `socket_version` is the protocol the socket negotiated, so it describes
+/// those exchanges as truthfully as the answered ones
 fn record_message(
     message_histogram: &Histogram<u64>,
     target_addr: &str,
-    response: &Result<Response<Incoming>, hyper::Error>,
+    outcome: MessageOutcome,
     started: Instant,
-    default_version: &'static str,
+    socket_version: &'static str,
 ) {
-    let (code, version) = response.as_ref().map_or((500, default_version), |r| {
-        (r.status().as_u16() as i64, hyper_version_str(r.version()))
-    });
+    let (code, version) = outcome.unwrap_or((0, socket_version));
 
     message_histogram.record(
         started.elapsed().as_millis() as u64,
@@ -372,25 +387,33 @@ where
             // Whether the backend answered, which is not the same as the adaptor accepting what it
             // answered: a rejected payload still came over a connection that works
             let answered = response.is_ok();
+            let outcome = message_outcome(&response);
 
-            record_message(
-                message_histogram,
-                &target_addr,
-                &response,
-                started,
-                "HTTP/1.1",
-            );
-
-            (answered, adaptor.process_http_response(response).await)
+            (
+                answered,
+                outcome,
+                adaptor.process_http_response(response).await,
+            )
         })
         .await;
 
+        // Recorded here rather than inside, so the exchange is reported once and reports what its
+        // sender is about to be told: a timeout that fired while the body was being collected has
+        // no status to report, however far the response had got
+        record_message(
+            message_histogram,
+            &target_addr,
+            exchanged.as_ref().ok().and_then(|(_, outcome, _)| *outcome),
+            started,
+            "HTTP/1.1",
+        );
+
         match exchanged {
-            Ok((answered, Ok(response))) => {
+            Ok((answered, _, Ok(response))) => {
                 let _ = msg.return_to_sender(response);
                 ControlFlow::Continue(answered)
             }
-            Ok((answered, Err(e))) => {
+            Ok((answered, _, Err(e))) => {
                 let _ = msg.return_error_to_sender(None, e);
                 ControlFlow::Continue(answered)
             }
@@ -655,14 +678,24 @@ where
                                     if response.is_ok() {
                                         served.store(true, Ordering::Relaxed);
                                     }
-                                    record_message(&message_histogram, &target_addr, &response, started, "HTTP/2");
-                                    adaptor.process_http_response(response).await
+                                    let outcome = message_outcome(&response);
+                                    (outcome, adaptor.process_http_response(response).await)
                                 })
                                 .await;
 
+                                // Recorded outside the timeout, so a request that ran out of time
+                                // is reported rather than left out of the histogram altogether
+                                record_message(
+                                    &message_histogram,
+                                    &target_addr,
+                                    answered.as_ref().ok().and_then(|(outcome, _)| *outcome),
+                                    started,
+                                    "HTTP/2",
+                                );
+
                                 match answered {
-                                    Ok(Ok(response)) => { let _ = req_msg.return_to_sender(response); },
-                                    Ok(Err(e)) => { let _ = req_msg.return_error_to_sender(None, e); },
+                                    Ok((_, Ok(response))) => { let _ = req_msg.return_to_sender(response); },
+                                    Ok((_, Err(e))) => { let _ = req_msg.return_error_to_sender(None, e); },
                                     Err(_) => { let _ = req_msg.return_error_to_sender(None, ServiceError::Timeout(service_name, http_timeout.as_millis() as u64)); },
                                 }
                             });

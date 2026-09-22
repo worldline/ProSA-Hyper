@@ -699,4 +699,75 @@ mod tests {
         // Wait on main task to end
         let _ = main_task.await;
     }
+
+    /// A client that opens a connection and never finishes its request headers must be closed.
+    ///
+    /// Hyper has a timeout for exactly this, but it only applies it when the builder was handed a
+    /// timer, and silently drops it otherwise. Without one the connection is held for as long as
+    /// the client likes, and with it a worker of the graceful shutdown
+    #[tokio::test]
+    async fn server_header_read_timeout() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const PROC_NAME: &str = "SRV_HEADER_TIMEOUT_PROC";
+
+        let mut settings = HttpTestSettings::new(
+            Url::parse("http://127.0.0.1:0").expect("Header timeout server URL should be valid"),
+            None,
+            None,
+        );
+
+        // Short enough that the test waits for it, long enough not to fire on a loaded machine
+        settings.server.header_read_timeout = 300;
+        let url = settings.server.listener.url.clone();
+
+        // Create bus and main processor
+        let (bus, main) = MainProc::<SimpleStringTvf>::create(&settings, Some(1));
+        let main_task = tokio::spawn(main.run());
+
+        // Launch an HTTP server processor
+        let http_server_proc = HyperServerProc::<SimpleStringTvf>::create(
+            1,
+            String::from(PROC_NAME),
+            bus.clone(),
+            settings.server,
+        );
+        Proc::<ServerTestAdaptor>::run(http_server_proc)
+            .expect("Hyper server processor should run");
+
+        // The listener is on the port 0, the processor publishes where it bound
+        let url = bound_url(PROC_NAME, &url).await;
+        let addr = format!(
+            "127.0.0.1:{}",
+            url.port().expect("Bound URL should have a port")
+        );
+
+        // A request the client never ends: the header block is left without its empty line
+        let mut stream = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("The Hyper server processor should accept a connection");
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .expect("The partial request should be sent");
+
+        // Reading to the end returns once the server closed its side, which is all the timeout has
+        // to do. Whatever it answers first is of no interest here
+        let closed = time::timeout(WAIT_TIME, async {
+            let mut answered = Vec::new();
+            stream.read_to_end(&mut answered).await
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "The Hyper server processor should close a connection that never finishes its request headers"
+        );
+
+        bus.stop("ProSA HTTP server header read timeout unit test end".into())
+            .await
+            .expect("ProSA should stop");
+
+        // Wait on main task to end
+        let _ = main_task.await;
+    }
 }

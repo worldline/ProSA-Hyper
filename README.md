@@ -38,6 +38,11 @@ hyper_server:
 
 If you have some slow services, you can set the `service_timeout` parameter (800 ms by default).
 
+An HTTP/1.1 client is given `header_read_timeout` (30 seconds by default) to send its request
+headers, after which its connection is closed. Set it to `0` to let a client take as long as it
+likes. It doesn't apply to HTTP/2, which carries the headers in frames the connection already
+bounds.
+
 When ProSA stops, the processor releases its listening port right away so a new client is refused
 instead of waiting, then answers the requests it still has in flight before shutting down.
 
