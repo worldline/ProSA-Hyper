@@ -1,8 +1,10 @@
-use std::{env, sync::Arc, time::Duration};
+use std::{env, io, sync::Arc, time::Duration};
 
 use hyper::server::conn::{http1, http2};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use opentelemetry::KeyValue;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::graceful::GracefulShutdown,
+};
 use prosa::{
     core::{
         adaptor::Adaptor,
@@ -12,17 +14,19 @@ use prosa::{
         service::ServiceError,
     },
     event::pending::PendingMsgs,
-    io::{SslConfig, listener::ListenerSetting, url_is_ssl},
+    io::listener::ListenerSetting,
+    otel::KeyValue,
+    tracing::{debug, info, warn},
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tokio::{sync::mpsc, task::JoinHandle};
 use url::Url;
 
-use crate::{H2, server::service::HyperService};
-
-use super::adaptor::HyperServerAdaptor;
+use crate::{
+    H2,
+    server::{adaptor::HyperServerAdaptor, service::HyperService},
+};
 
 /// Hyper server processor settings
 #[proc_settings]
@@ -34,6 +38,10 @@ pub struct HyperServerSettings {
     /// Timeout for internal service requests
     #[serde(default = "HyperServerSettings::default_service_timeout")]
     pub service_timeout: Duration,
+    /// Time an HTTP/1.1 client is given to send its request headers, in milliseconds.
+    /// Zero disables it
+    #[serde(default = "HyperServerSettings::default_header_read_timeout")]
+    pub header_read_timeout: u64,
 }
 
 impl HyperServerSettings {
@@ -52,6 +60,19 @@ impl HyperServerSettings {
         Duration::from_millis(800)
     }
 
+    fn default_header_read_timeout() -> u64 {
+        30000
+    }
+
+    /// Time an HTTP/1.1 client is given to send its request headers, [`None`] when it is disabled.
+    ///
+    /// A connection that sends half a request line and stops holds a task of its own, and a worker
+    /// of the graceful shutdown, for as long as it likes. Only HTTP/1.1 has it: HTTP/2 carries the
+    /// headers in frames the connection already bounds
+    pub(crate) fn header_read_timeout(&self) -> Option<Duration> {
+        (self.header_read_timeout > 0).then(|| Duration::from_millis(self.header_read_timeout))
+    }
+
     /// Create a new Hyper Server settings
     pub fn new(listener: ListenerSetting, service_timeout: Duration) -> HyperServerSettings {
         HyperServerSettings {
@@ -68,8 +89,34 @@ impl Default for HyperServerSettings {
         HyperServerSettings {
             listener: Self::default_listener(),
             service_timeout: Self::default_service_timeout(),
+            header_read_timeout: Self::default_header_read_timeout(),
         }
     }
+}
+
+/// How long the accept loop waits after an error that isn't about the client it was accepting.
+///
+/// Short enough that a momentary shortage of file descriptors costs a few connections, long enough
+/// that the loop doesn't spin while it lasts
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Method to know if an accept error concerns only the client that was being accepted, so the next
+/// accept is unaffected and the loop can go straight back to it.
+///
+/// Nothing else is fatal either: an accept error is never a reason to drop the connections the
+/// processor is already serving. The rest is retried after [`ACCEPT_RETRY_DELAY`], because the ones
+/// that aren't about a client — running out of file descriptors, above all — leave the connection
+/// in the backlog and would be returned again immediately. Those have no
+/// [`std::io::ErrorKind`](io::ErrorKind) of their own on stable Rust, which is the other reason
+/// they can't be named here
+fn accept_is_per_client(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+    )
 }
 
 /// Hyper server processor
@@ -87,12 +134,28 @@ where
         + std::fmt::Debug
         + prosa::core::msg::Tvf
         + std::default::Default,
-    A: 'static + Adaptor + HyperServerAdaptor<M> + Clone + std::marker::Send + std::marker::Sync,
+    A: 'static + Adaptor + HyperServerAdaptor<M> + std::marker::Send + std::marker::Sync,
 {
     /// Main loop of the processor
     async fn internal_run(&mut self) -> Result<(), Box<dyn ProcError + Send + Sync>> {
-        // Initiate an adaptor for the hyper server processor
-        let adaptor = A::new(self)?;
+        // Force default protocol to HTTP2 for SSL
+        self.settings
+            .listener
+            .set_alpn(vec!["h2".into(), "http/1.1".into()]);
+
+        // The listener is shared with every task that handshakes a client, so it can't be replaced
+        // to serve a new certificate. `bind_raw` leaves the SSL parameters out of it and hands them
+        // over instead, which makes the handshaker below the only copy and a rotation a plain
+        // assignment. `None` when the processor listens without SSL
+        let (bound_listener, mut handshaker) = self.settings.listener.bind_raw().await?;
+        let local_addr = bound_listener.local_addr()?;
+        let mut listener = Some(Arc::new(bound_listener));
+        info!("Listening on {local_addr}");
+
+        // Initiate an adaptor for the hyper server processor.
+        // The very same instance is shared with every `HyperService`, so a configuration reload
+        // through `Adaptor::reload_config` is seen by the requests being served
+        let adaptor = Arc::new(A::new(self, local_addr)?);
 
         // Add proc main queue (id: 0)
         self.proc.add_proc().await?;
@@ -102,17 +165,6 @@ where
 
         // Declare a list for pending HTTP request
         let mut pending_req = PendingMsgs::<RequestMsg<M>, M>::default();
-
-        // Set default protocol to HTTP2
-        if url_is_ssl(&self.settings.listener.url) {
-            if let Some(ssl) = self.settings.listener.ssl.as_mut() {
-                ssl.set_alpn(vec!["h2".into(), "http/1.1".into()]);
-            } else {
-                let mut ssl = SslConfig::default();
-                ssl.set_alpn(vec!["h2".into(), "http/1.1".into()]);
-                self.settings.listener.ssl = Some(ssl);
-            }
-        }
 
         // Meter to log HTTP reponses
         let meter = self.get_proc_param().meter("hyper_server");
@@ -125,10 +177,16 @@ where
             .with_description("Hyper HTTP server socket counter")
             .build();
 
-        let listener = Arc::new(self.settings.listener.bind().await?);
-        let service_adaptor = Arc::new(adaptor.clone());
-        info!("Listening on {:?}", listener.local_addr());
+        // `Some` while the processor serves. Taken when it is asked to stop, to signal every open
+        // connection to answer what it has in flight and then close
+        let mut graceful = Some(GracefulShutdown::new());
+
+        // `None` until the processor is asked to stop, then holds the task that drains the connections
+        let mut draining: Option<JoinHandle<()>> = None;
+
         loop {
+            // Clone the listener so the configuration reload can swap it while an accept is pending
+            let accept_listener = listener.clone();
             tokio::select! {
                 Some(msg) = self.internal_rx_queue.recv() => {
                     match msg {
@@ -138,10 +196,19 @@ where
                             msg
                         ),
                         InternalMsg::Response(mut msg) => {
-                            if let Some(hyper_msg) = pending_req.pull_msg(msg.get_id())
-                                && let Some(data) = msg.take_data()
-                            {
-                                let _ = hyper_msg.return_to_sender(data);
+                            if let Some(hyper_msg) = pending_req.pull_msg(msg.get_id()) {
+                                match msg.take_data() {
+                                    Some(data) => { let _ = hyper_msg.return_to_sender(data); }
+                                    // The request is out of the pending list, so nothing else will
+                                    // answer it. A response that carries nothing can't be turned
+                                    // into an HTTP one, and saying so now is better than letting
+                                    // the client wait out the service timeout for a service that
+                                    // did answer
+                                    None => {
+                                        let service_name = hyper_msg.get_service().clone();
+                                        let _ = hyper_msg.return_error_to_sender(None, ServiceError::ProtocolError(service_name));
+                                    }
+                                }
                             }
                         }
                         InternalMsg::Error(mut err_msg) => {
@@ -149,14 +216,72 @@ where
                                 let _ = hyper_err_msg.return_error_to_sender(err_msg.take_data(), err_msg.into_err());
                             }
                         }
-                        InternalMsg::Command(_) => todo!(),
-                        InternalMsg::Config => todo!(),
                         InternalMsg::Service(table) => self.service = table,
+                        // A reload landing while the processor drains would bind a listener it will never accept from
+                        InternalMsg::Config(config) => if graceful.is_some() {
+                            match config.reload_proc::<HyperServerSettings>(self.proc.as_ref(), adaptor.as_ref()) {
+                                Ok(mut settings) => {
+                                    // Normalize the ALPN as done at startup before comparing
+                                    settings.listener.set_alpn(vec!["h2".into(), "http/1.1".into()]);
+
+                                    // Only listening somewhere else needs a new socket. Turning SSL on,
+                                    // off, or rotating a certificate is served on the socket that is
+                                    // already bound, by the handshaker rebuilt below
+                                    if self.settings.listener.needs_rebind(&settings.listener) {
+                                        match settings.listener.bind_raw().await {
+                                            Ok((new_listener, new_handshaker)) => {
+                                                let local_addr = new_listener.local_addr();
+                                                handshaker = new_handshaker;
+                                                listener = Some(Arc::new(new_listener));
+                                                match local_addr {
+                                                    Ok(addr) => info!("Reload the Hyper server processor configuration, listening on {addr}"),
+                                                    Err(e) => info!("Reload the Hyper server processor configuration, can't read the address it bound: {e}"),
+                                                }
+                                            }
+                                            // An address the processor can't bind is no reason to lose the
+                                            // one it serves on, so keep the listener and the settings that describe it
+                                            Err(e) => {
+                                                warn!("Can't listen on {}, keep the previous address: {e}", settings.listener.get_safe_url());
+                                                settings.listener = self.settings.listener.clone();
+                                            }
+                                        }
+                                    } else {
+                                        // Built again whatever the configuration says, because it holds
+                                        // the path of the certificate and not the certificate: a renewal
+                                        // that rewrites the file in place leaves the two configurations
+                                        // equal, so comparing them would skip exactly the reload this is
+                                        // for. One file read, and neither the socket nor an established
+                                        // connection is touched
+                                        match settings.listener.build_handshaker().await {
+                                            Ok(new_handshaker) => {
+                                                handshaker = new_handshaker;
+                                                info!("Reload the Hyper server processor configuration, serving {}", settings.listener.get_safe_url());
+                                            }
+                                            // The processor keeps serving the certificate it has, so the
+                                            // settings have to keep describing it
+                                            Err(e) => {
+                                                warn!("Can't serve the certificate of {}, keep the previous one: {e}", settings.listener.get_safe_url());
+                                                settings.listener = self.settings.listener.clone();
+                                            }
+                                        }
+                                    }
+
+                                    // The service timeout is picked up by the next request
+                                    self.settings = settings;
+                                }
+                                Err(e) => warn!("Failed to reload configuration for processor {}: {e}", self.name()),
+                            }
+                        }
                         InternalMsg::Shutdown => {
-                            adaptor.terminate();
-                            self.proc.remove_proc(None).await?;
-                            warn!("The Hyper server processor will shut down");
-                            return Ok(());
+                            // Release the port right away. A listener left bound but never accepted from
+                            // would have the kernel complete handshakes into the accept queue, so a new
+                            // client would wait out the whole drain only to be reset
+                            listener = None;
+
+                            if let Some(graceful) = graceful.take() {
+                                warn!("The Hyper server processor stops accepting and drains its connections");
+                                draining = Some(tokio::task::spawn(graceful.shutdown()));
+                            }
                         }
                     }
                 },
@@ -166,8 +291,17 @@ where
                     {
                         let request = RequestMsg::new(http_msg.get_service().clone(), http_msg_data, self.proc.get_service_queue().clone());
                         let request_id = request.get_id();
-                        service.proc_queue.send(InternalMsg::Request(request)).await?;
-                        pending_req.push_with_id(request_id, http_msg, self.settings.service_timeout);
+
+                        // A processor that stopped since the service table was received only concerns
+                        // this request. Answering it keeps the ones already in flight alive
+                        if let Err(e) = service.proc_queue.send(InternalMsg::Request(request)).await {
+                            warn!(parent: http_msg.get_span(), code = "503", "hyper::server::Msg");
+                            debug!("Can't reach the service {}: {e}", http_msg.get_service());
+                            let service_name = http_msg.get_service().clone();
+                            let _ = http_msg.return_error_to_sender(None, ServiceError::UnableToReachService(service_name));
+                        } else {
+                            pending_req.push_with_id(request_id, http_msg, self.settings.service_timeout);
+                        }
                     } else {
                         warn!(
                             parent: http_msg.get_span(),
@@ -179,16 +313,50 @@ where
                         let _ = http_msg.return_error_to_sender(data, ServiceError::UnableToReachService(service_name));
                     }
                 },
-                accept_result = listener.accept_raw() => {
-                    let (stream, addr) = accept_result?;
+                Some(accept_result) = async {
+                    match &accept_listener {
+                        Some(listener) => Some(listener.accept_raw().await),
+                        None => None,
+                    }
+                }, if accept_listener.is_some() => {
+                    let (stream, addr) = match accept_result {
+                        Ok(accepted) => accepted,
+                        Err(e) => {
+                            if accept_is_per_client(&e) {
+                                debug!("Lost a client before it was accepted: {e}");
+                            } else {
+                                // Out of file descriptors and the like. The connection stays in the
+                                // backlog and the listener stays readable, so accepting again right
+                                // away would spin on the same error at the speed of the machine
+                                warn!("Can't accept a client, retrying in {} ms: {e}", ACCEPT_RETRY_DELAY.as_millis());
+                                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                            }
 
-                    let listener = listener.clone();
-                    let service_adaptor = service_adaptor.clone();
+                            continue;
+                        }
+                    };
+
+                    // The watcher is taken before the connection is spawned, so a shutdown asked
+                    // in between is not missed
+                    let Some(watcher) = graceful.as_ref().map(GracefulShutdown::watcher) else {
+                        continue;
+                    };
+
+                    // Owned snapshot of the SSL parameters, so a rotation doesn't wait for the
+                    // handshake and the client is served the certificate of its accept
+                    let handshaker = handshaker.clone();
+                    let header_read_timeout = self.settings.header_read_timeout();
+                    let service_adaptor = adaptor.clone();
                     let http_tx = http_tx.clone();
                     let http_counter = observable_http_counter.clone();
                     let http_socket = observable_http_socket.clone();
                     tokio::task::spawn(async move {
-                        match listener.handshake(stream).await {
+                        let handshake = match handshaker {
+                            Some(handshaker) => handshaker.handshake(stream).await,
+                            None => Ok(stream),
+                        };
+
+                        match handshake {
                             Ok(stream) => {
                                 let is_http2 = stream.selected_alpn_check(|alpn| alpn == H2);
 
@@ -197,21 +365,24 @@ where
                                 let io = TokioIo::new(stream);
                                 let service = HyperService::new(service_adaptor, http_tx, http_counter);
                                 if is_http2 {
-                                    if let Err(err) = http2::Builder::new(TokioExecutor::new())
+                                    if let Err(err) = watcher.watch(
+                                        http2::Builder::new(TokioExecutor::new()).serve_connection(
+                                            io,
+                                            service,
+                                        )
+                                    ).await
+                                    {
+                                        warn!("Failed to serve http/2 connection[{addr}]: {err:?}");
+                                    }
+                                } else if let Err(err) = watcher.watch(
+                                    http1::Builder::new()
+                                        .timer(TokioTimer::new())
+                                        .header_read_timeout(header_read_timeout)
                                         .serve_connection(
                                             io,
                                             service,
                                         )
-                                        .await
-                                    {
-                                        warn!("Failed to serve http/2 connection[{addr}]: {err:?}");
-                                    }
-                                } else if let Err(err) = http1::Builder::new()
-                                    .serve_connection(
-                                        io,
-                                        service,
-                                    )
-                                    .await
+                                ).await
                                 {
                                     warn!("Failed to serve http/1 connection[{addr}]: {err:?}");
                                 }
@@ -224,6 +395,13 @@ where
                         debug!("Connection closed {addr}");
                     });
                 },
+                // Every connection has been answered and closed, nothing is left to serve
+                Some(_) = async {
+                    match draining.as_mut() {
+                        Some(drain) => Some(drain.await),
+                        None => None,
+                    }
+                }, if draining.is_some() => break,
                 Some(mut msg) = pending_req.pull(), if !pending_req.is_empty() => {
                     warn!(parent: msg.get_span(), "Timeout message {:?}", msg);
                     let data = msg.take_data();
@@ -238,5 +416,39 @@ where
                 },
             }
         }
+
+        adaptor.terminate();
+        self.proc.remove_proc(None).await?;
+        warn!("The Hyper server processor is shut down");
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_client_being_accepted_is_retried_at_once() {
+        // A client that went away between the SYN and the accept, and a syscall a signal
+        // interrupted: the connection is out of the backlog, so the next accept makes progress
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::Interrupted,
+        ] {
+            assert!(
+                accept_is_per_client(&io::Error::from(kind)),
+                "{kind:?} concerns only the client being accepted"
+            );
+        }
+
+        // Running out of file descriptors has no `ErrorKind` of its own, so it arrives
+        // uncategorized and has to be the case that waits
+        assert!(!accept_is_per_client(&io::Error::from_raw_os_error(24)));
+        assert!(!accept_is_per_client(&io::Error::from_raw_os_error(23)));
+        assert!(!accept_is_per_client(&io::Error::other("broken listener")));
     }
 }

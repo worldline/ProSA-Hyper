@@ -1,26 +1,20 @@
 //! Hyper service definition
 
-use std::convert::Infallible;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{convert::Infallible, future::Future, pin::Pin, sync::Arc};
 
 use bytes::Bytes;
 use http::StatusCode;
-use http_body_util::combinators::BoxBody;
-use http_body_util::{Empty, Full};
-use hyper::service::Service;
-use hyper::{Request, Response};
-use opentelemetry::KeyValue;
-use opentelemetry::metrics::Counter;
-use prosa::core::msg::{InternalMsg, Msg, RequestMsg};
+use http_body_util::{Empty, Full, combinators::BoxBody};
+use hyper::{Request, Response, service::Service};
+use prosa::{
+    core::msg::{InternalMsg, Msg, RequestMsg},
+    otel::{KeyValue, metrics::Counter},
+};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{HttpError, hyper_version_str};
+use crate::{HttpError, hyper_version_str, server::adaptor::HyperServerAdaptor};
 
-use super::adaptor::HyperServerAdaptor;
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 /// Struct to define parameters for a service (HTTP server)
 pub(crate) struct HyperService<A, M>
 where
@@ -41,7 +35,7 @@ where
 
 impl<A, M> HyperService<A, M>
 where
-    A: 'static + HyperServerAdaptor<M> + Clone + std::marker::Sync + std::marker::Send,
+    A: 'static + HyperServerAdaptor<M> + std::marker::Sync + std::marker::Send,
     M: 'static
         + std::marker::Send
         + std::marker::Sync
@@ -144,7 +138,7 @@ where
 
 impl<A, M> Service<Request<hyper::body::Incoming>> for HyperService<A, M>
 where
-    A: 'static + HyperServerAdaptor<M> + Clone + std::marker::Sync + std::marker::Send,
+    A: 'static + HyperServerAdaptor<M> + std::marker::Sync + std::marker::Send,
     M: 'static
         + std::marker::Send
         + std::marker::Sized
