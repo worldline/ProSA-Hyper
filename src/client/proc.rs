@@ -7,12 +7,15 @@ use prosa::{
         msg::InternalMsg,
         proc::{Proc, ProcBusParam as _, ProcConfig as _, ProcParam, proc, proc_settings},
     },
-    io::stream::TargetSetting,
+    io::{
+        pool::{Backoff, SocketControlSender, control_channel},
+        stream::TargetSetting,
+    },
     tracing::{debug, info, warn},
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{mpsc, watch},
+    sync::mpsc,
     task::{self, JoinError, JoinSet},
 };
 
@@ -91,36 +94,16 @@ impl HyperClientSettings {
         Duration::from_millis(self.http_timeout)
     }
 
-    /// Maximum delay between two reconnection attempts of a socket, never below the floor
-    fn max_reconnect_delay(&self) -> Duration {
-        Duration::from_millis(self.max_reconnect_delay).max(MIN_RECONNECT_DELAY)
-    }
-
-    /// Delay of the first reconnection attempt of a socket.
+    /// How a socket spaces out its reconnection attempts to a backend that is down.
     ///
-    /// Doubles as how long a connection that served nothing must have lasted to count as a working
-    /// one, so a socket never reconnects faster than it would after a refused connection.
-    ///
-    /// Floored, because a zero would do both at once: no wait between two attempts, and every
-    /// attempt counting as a working connection, so the retry count would never grow and a backend
-    /// that refuses everything would be dialled at the speed of the machine
-    pub(crate) fn base_reconnect_delay(&self) -> Duration {
-        Duration::from_millis(self.reconnect_delay)
-            .min(self.max_reconnect_delay())
-            .max(MIN_RECONNECT_DELAY)
-    }
-
-    /// Delay to wait before the `retry`-th consecutive reconnection attempt of a socket.
-    ///
-    /// `retry` is zero for a socket that never failed, which connects without waiting
-    pub(crate) fn reconnect_delay(&self, retry: u32) -> Duration {
-        if retry == 0 {
-            return Duration::ZERO;
-        }
-
-        self.base_reconnect_delay()
-            .saturating_mul(1u32.checked_shl(retry - 1).unwrap_or(u32::MAX))
-            .min(self.max_reconnect_delay())
+    /// Built on every read rather than held, so a configuration reload applies to the next attempt.
+    /// [`Backoff`] does the clamping, which is what keeps a configured zero from dialling a backend
+    /// that refuses everything at the speed of the machine
+    pub(crate) fn backoff(&self) -> Backoff {
+        Backoff::new(
+            Duration::from_millis(self.reconnect_delay),
+            Duration::from_millis(self.max_reconnect_delay),
+        )
     }
 
     /// Negotiate HTTP/2 first on every SSL backend, so a backend compares equal to the target of a
@@ -151,12 +134,6 @@ impl Default for HyperClientSettings {
 /// Depth of the bus queue of a socket, as many messages as the processor's own queue
 const SOCKET_QUEUE_SIZE: usize = 2048;
 
-/// Shortest a socket ever waits between two connection attempts.
-///
-/// Short enough that a configured delay is used as written, and that the doubling still reaches
-/// `max_reconnect_delay` in a dozen attempts, but not zero
-const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(10);
-
 /// One socket the processor wants to keep open to a backend
 #[derive(Debug)]
 struct SocketHandle {
@@ -168,7 +145,7 @@ struct SocketHandle {
     /// Service the socket advertises, so renaming it replaces the whole pool
     service_name: String,
     /// What the processor decides for the socket, out of band from the requests it serves
-    control: watch::Sender<SocketControl>,
+    control: SocketControlSender<SocketControl>,
     /// Task currently running the socket, which is how a slot is found again from a join error
     task: task::Id,
 }
@@ -268,7 +245,7 @@ where
         // flight and come back through the task set, where the processor finds no handle for them
         self.handles.retain(|handle| {
             if let Some(backend) = handle.matching_backend(settings) {
-                handle.control.send_modify(|control| {
+                handle.control.update(|control| {
                     control.connect_timeout = backend.connect_timeout;
                     control.http_timeout = settings.http_timeout();
                 });
@@ -279,7 +256,7 @@ where
                     handle.id,
                     handle.target.get_safe_url()
                 );
-                handle.control.send_modify(|control| control.stopped = true);
+                handle.control.stop();
                 false
             }
         });
@@ -309,8 +286,10 @@ where
         A: 'static + Adaptor + HyperClientAdaptor<M> + std::marker::Send + std::marker::Sync,
     {
         let (tx_queue, rx_queue) = mpsc::channel(SOCKET_QUEUE_SIZE);
-        let (control_tx, control_rx) =
-            SocketControl::channel(target.connect_timeout, settings.http_timeout());
+        let (control_tx, control_rx) = control_channel(SocketControl {
+            connect_timeout: target.connect_timeout,
+            http_timeout: settings.http_timeout(),
+        });
         let id = self.next_id;
         self.next_id += 1;
 
@@ -405,7 +384,7 @@ where
     /// bounding it again here would only cut a drain short of the budget it was given
     async fn shutdown(&mut self) {
         for handle in &self.handles {
-            handle.control.send_modify(|control| control.stopped = true);
+            handle.control.stop();
         }
         self.handles.clear();
 
@@ -566,30 +545,13 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_delay_backoff() {
-        let settings = HyperClientSettings::new("hyper".into());
-
-        // A socket that never failed reconnects right away
-        assert_eq!(Duration::ZERO, settings.reconnect_delay(0));
-
-        // Then the delay doubles on every consecutive failure, up to the maximum
-        assert_eq!(Duration::from_millis(500), settings.reconnect_delay(1));
-        assert_eq!(Duration::from_millis(1000), settings.reconnect_delay(2));
-        assert_eq!(Duration::from_millis(2000), settings.reconnect_delay(3));
-        assert_eq!(Duration::from_secs(30), settings.reconnect_delay(7));
-
-        // A backend that stays down for a long time must not overflow the delay
-        assert_eq!(Duration::from_secs(30), settings.reconnect_delay(u32::MAX));
-    }
-
-    #[test]
-    fn reconnect_delay_below_first_attempt() {
-        // A maximum lower than the first delay caps it, instead of reconnecting slower than the
-        // maximum on the first attempt
+    fn reconnect_delays_reach_the_backoff() {
+        // Only the wiring: how the delays grow and how they are clamped is `Backoff`'s own, and
+        // tested there
         let settings: HyperClientSettings = config::Config::builder()
-            .set_override("reconnect_delay", 5000)
+            .set_override("reconnect_delay", 200)
             .expect("Reconnect delay override should be valid")
-            .set_override("max_reconnect_delay", 1000)
+            .set_override("max_reconnect_delay", 4000)
             .expect("Maximum reconnect delay override should be valid")
             .set_override("service_name", "hyper")
             .expect("Service name override should be valid")
@@ -600,36 +562,15 @@ mod tests {
             .try_deserialize()
             .expect("Hyper client settings should be valid");
 
-        // Asserted on the base delay too: `reconnect_delay` caps against the maximum on its way
-        // out, so it would read the same whether the base was clamped or not
-        assert_eq!(Duration::from_secs(1), settings.base_reconnect_delay());
-        assert_eq!(Duration::from_secs(1), settings.reconnect_delay(1));
-        assert_eq!(Duration::from_secs(1), settings.reconnect_delay(9));
-    }
+        assert_eq!(
+            Backoff::new(Duration::from_millis(200), Duration::from_secs(4)),
+            settings.backoff()
+        );
 
-    #[test]
-    fn reconnect_delay_is_never_zero() {
-        // A socket that waited nothing and counted every attempt as a working connection would dial
-        // a backend that refuses everything at the speed of the machine
-        let settings: HyperClientSettings = config::Config::builder()
-            .set_override("reconnect_delay", 0)
-            .expect("Reconnect delay override should be valid")
-            .set_override("max_reconnect_delay", 0)
-            .expect("Maximum reconnect delay override should be valid")
-            .set_override("service_name", "hyper")
-            .expect("Service name override should be valid")
-            .set_override("backends", Vec::<String>::new())
-            .expect("Backends override should be valid")
-            .build()
-            .expect("Configuration should be valid")
-            .try_deserialize()
-            .expect("Hyper client settings should be valid");
-
-        assert!(!settings.base_reconnect_delay().is_zero());
-        assert!(!settings.reconnect_delay(1).is_zero());
-        assert!(!settings.reconnect_delay(u32::MAX).is_zero());
-
-        // The first attempt of a socket that never failed still doesn't wait
-        assert_eq!(Duration::ZERO, settings.reconnect_delay(0));
+        // The defaults are the ones the README documents
+        assert_eq!(
+            Backoff::new(Duration::from_millis(500), Duration::from_secs(30)),
+            HyperClientSettings::new("hyper".into()).backoff()
+        );
     }
 }

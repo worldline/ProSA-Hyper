@@ -6,8 +6,9 @@
 //! Two channels reach a socket, and they carry different things. The bus queue carries the
 //! requests, and it is as deep as the traffic the socket is behind on, so anything put there is
 //! only read once the socket caught up. What the processor decides — the message timeout, and
-//! whether the socket should stop — goes through a [`watch`] channel instead, which is always
-//! current, reaches a socket that is busy serving, and never blocks the processor's loop.
+//! whether the socket should stop — goes through a [`prosa::io::pool`] control channel instead,
+//! which is always current, reaches a socket that is busy serving, and never blocks the
+//! processor's loop.
 
 use std::{
     convert::Infallible,
@@ -36,7 +37,10 @@ use prosa::{
         proc::{ProcBusParam as _, ProcParam},
         service::ServiceError,
     },
-    io::stream::{Stream, TargetSetting},
+    io::{
+        pool::{SocketControlReceiver, retire_queue},
+        stream::{Stream, TargetSetting},
+    },
     otel::{
         KeyValue,
         metrics::{Histogram, UpDownCounter},
@@ -44,7 +48,7 @@ use prosa::{
     tracing::{debug, info, warn},
 };
 use tokio::{
-    sync::{mpsc, watch},
+    sync::mpsc,
     task::JoinSet,
     time::{self, timeout},
 };
@@ -94,22 +98,6 @@ pub(super) struct SocketControl {
     pub(super) connect_timeout: u64,
     /// Timeout applied to the next HTTP message
     pub(super) http_timeout: Duration,
-    /// Set once the processor retires the socket
-    pub(super) stopped: bool,
-}
-
-impl SocketControl {
-    /// Open the control channel of a socket the processor is about to spawn
-    pub(super) fn channel(
-        connect_timeout: u64,
-        http_timeout: Duration,
-    ) -> (watch::Sender<Self>, watch::Receiver<Self>) {
-        watch::channel(SocketControl {
-            connect_timeout,
-            http_timeout,
-            stopped: false,
-        })
-    }
 }
 
 /// Status and protocol of an exchange, [`None`] when the backend answered neither
@@ -156,7 +144,7 @@ fn record_message(
 ///
 /// A socket connects to its backend, serves what its bus queue brings until the connection ends or
 /// it is asked to stop, then hands itself back. Which sockets must exist is the processor's call,
-/// and the way it retires one is [`SocketControl::stopped`].
+/// and the way it retires one is [`SocketControlSender::stop`](prosa::io::pool::SocketControlSender::stop).
 #[derive(Debug)]
 pub(crate) struct HyperClientSocket<M>
 where
@@ -171,7 +159,7 @@ where
     /// Number of consecutive failed connection attempts, delaying the next reconnection
     retry: u32,
     /// What the processor decides for the socket, always current
-    control: watch::Receiver<SocketControl>,
+    control: SocketControlReceiver<SocketControl>,
     /// Queue the bus brings the requests to.
     ///
     /// Kept across reconnections, so a request that arrives while the socket is down is served by
@@ -198,7 +186,7 @@ where
         id: u32,
         target: TargetSetting,
         service_name: String,
-        control: watch::Receiver<SocketControl>,
+        control: SocketControlReceiver<SocketControl>,
         rx_queue: mpsc::Receiver<InternalMsg<M>>,
         tx_queue: mpsc::Sender<InternalMsg<M>>,
     ) -> Self {
@@ -223,55 +211,9 @@ where
         self.control.borrow().http_timeout
     }
 
-    /// Answer `true` once the processor retired the socket.
-    ///
-    /// Reads without marking the value seen, so it never consumes the wake-up [`Self::stopped`] is
-    /// waiting for
-    fn is_stopped(&self) -> bool {
-        self.control.borrow().stopped
-    }
-
-    /// Resolve once the processor retires the socket, and never otherwise.
-    ///
-    /// A dropped sender counts as retired: the processor only ever lets a handle go after it set
-    /// [`SocketControl::stopped`], and a closed channel makes `changed` return instantly forever,
-    /// which as a `select!` arm would spin the socket rather than stop it
-    async fn stopped(control: &mut watch::Receiver<SocketControl>) {
-        while control.changed().await.is_ok() {
-            if control.borrow().stopped {
-                return;
-            }
-        }
-    }
-
-    /// Answer whatever still reaches a socket that won't come back, until nobody can reach it.
-    ///
-    /// The bus is told to remove the queue, but a processor that hasn't received the new service
-    /// table yet still holds it and still sends to it. Closing it there turns a request that should
-    /// have come back `UnableToReachService` into a send error for its sender, and a processor that
-    /// treats that as fatal restarts on it. So the queue outlives the socket, answering rather than
-    /// closing, and only goes away once the last sender did.
+    /// Answer whatever still reaches a socket that won't come back, until nobody can reach it
     pub(super) fn retire(self) {
-        let HyperClientSocket {
-            service_name,
-            mut rx_queue,
-            tx_queue,
-            ..
-        } = self;
-
-        // The socket holds a sending end of its own queue, which would keep it open forever
-        drop(tx_queue);
-
-        tokio::spawn(async move {
-            while let Some(msg) = rx_queue.recv().await {
-                if let InternalMsg::Request(req_msg) = msg {
-                    let _ = req_msg.return_error_to_sender(
-                        None,
-                        ServiceError::UnableToReachService(service_name.clone()),
-                    );
-                }
-            }
-        });
+        retire_queue(self.rx_queue, self.tx_queue);
     }
 
     /// Declare the socket queue and the service it serves to the bus
@@ -457,7 +399,7 @@ where
         // its own, and a socket that has not finished shaking hands holds nothing anyone waits on
         let handshake = tokio::select! {
             handshake = time::timeout(connect_timeout, http1::handshake(io)) => handshake,
-            _ = Self::stopped(&mut self.control) => return Ok(true),
+            _ = self.control.stopped() => return Ok(true),
         };
         let (mut sender, connection) = self.handshake_result(handshake, "HTTP1")?;
 
@@ -487,11 +429,11 @@ where
                     break;
                 }
                 // The processor retired the socket
-                _ = Self::stopped(&mut self.control) => break,
+                _ = self.control.stopped() => break,
                 // Receive a message to send from the queue. A retired socket stops taking them, so
                 // the exchange it is in the middle of is the last one it serves: the arms above
                 // are only reached between two of them, never during one
-                Some(msg) = self.rx_queue.recv(), if !self.is_stopped() => {
+                Some(msg) = self.rx_queue.recv(), if !self.control.is_stopped() => {
                     debug!(socket_id = self.id, addr = %self.target, "HTTP client receive a message to send: {msg:?}");
                     match msg {
                         InternalMsg::Request(req_msg) => {
@@ -597,7 +539,7 @@ where
         // its own, and a socket that has not finished shaking hands holds nothing anyone waits on
         let handshake = tokio::select! {
             handshake = time::timeout(connect_timeout, http2::handshake(TokioExecutor::new(), io)) => handshake,
-            _ = Self::stopped(&mut self.control) => return Ok(true),
+            _ = self.control.stopped() => return Ok(true),
         };
         let (sender, connection) = self.handshake_result(handshake, "HTTP2")?;
 
@@ -635,7 +577,7 @@ where
                     break;
                 }
                 // The processor retired the socket
-                _ = Self::stopped(&mut self.control) => break,
+                _ = self.control.stopped() => break,
                 // Reap the requests that are done, so the set doesn't grow with the socket. A task
                 // that panicked took the request it held with it, which nothing can answer anymore,
                 // so the least it can do is not be silent about it
@@ -646,7 +588,7 @@ where
                 },
                 // Receive a message to send from the queue. A retired socket stops taking them and
                 // drains the ones it multiplexed rather than starting another
-                Some(msg) = self.rx_queue.recv(), if !self.is_stopped() => {
+                Some(msg) = self.rx_queue.recv(), if !self.control.is_stopped() => {
                     match msg {
                         InternalMsg::Request(mut req_msg) => {
                             let Some(data) = req_msg.take_data() else {
@@ -754,7 +696,7 @@ where
         // take two `connect_timeout` with the handshake below, so the shutdown is raced against it
         let stream = tokio::select! {
             stream = self.target.connect() => stream?,
-            _ = Self::stopped(&mut self.control) => return Ok(true),
+            _ = self.control.stopped() => return Ok(true),
         };
 
         let io = TokioIo::new(stream);
@@ -806,7 +748,7 @@ where
         loop {
             tokio::select! {
                 _ = &mut sleep => return ControlFlow::Continue(()),
-                _ = Self::stopped(&mut self.control) => return ControlFlow::Break(()),
+                _ = self.control.stopped() => return ControlFlow::Break(()),
                 Some(msg) = self.rx_queue.recv() => {
                     match msg {
                         InternalMsg::Request(req_msg) => {
@@ -840,27 +782,27 @@ where
     where
         A: 'static + Adaptor + HyperClientAdaptor<M> + std::marker::Send + std::marker::Sync,
     {
-        let reconnect_delay = settings.reconnect_delay(self.retry);
-        let healthy_connection = settings.base_reconnect_delay();
+        // Read at spawn rather than held, so a reload that retimes the backoff applies to the next
+        // attempt of every socket, including the ones already waiting one out
+        let backoff = settings.backoff();
+        let reconnect_delay = backoff.delay(self.retry);
 
         join_set
             .spawn(async move {
-                if self.is_stopped() || self.wait_reconnect(reconnect_delay).await.is_break() {
+                if self.control.is_stopped()
+                    || self.wait_reconnect(reconnect_delay).await.is_break()
+                {
                     return (self, None);
                 }
 
                 let connected = self
-                    .connect(&proc, &adaptor, &meters, healthy_connection)
+                    .connect(&proc, &adaptor, &meters, backoff.healthy_connection())
                     .await;
 
                 // Back off from a backend the socket couldn't get a working connection out of, whether
                 // it refused one or gave one it closed straight away. Both look the same to a caller,
                 // and reconnecting either without waiting is a loop at the speed of the machine
-                self.retry = if matches!(connected, Ok(true)) {
-                    0
-                } else {
-                    self.retry.saturating_add(1)
-                };
+                self.retry = backoff.next_retry(self.retry, matches!(connected, Ok(true)));
 
                 (self, connected.err())
             })
