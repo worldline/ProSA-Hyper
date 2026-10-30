@@ -1,0 +1,6 @@
+graph LR
+    OUT[Output HTTP server]
+    ProSA[ProSA Hyper Processor]
+
+    ProSA-- HTTP request (process_srv_request) -->OUT
+    OUT-- HTTP response (process_http_response) -->ProSA

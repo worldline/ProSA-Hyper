@@ -8,17 +8,9 @@ use url::Url;
 
 use crate::client::proc::HyperClientProc;
 
-#[cfg_attr(doc, aquamarine::aquamarine)]
 /// Trait to define the Hyper adaptor structure
 ///
-/// ```mermaid
-/// graph LR
-///     OUT1[Output HTTP server]
-///     ProSA[ProSA Hyper Procesor]
-///
-///     ProSA-- HTTP request (process_client_request) -->OUT
-///     OUT-- HTTP response (process_client_response) -->ProSA
-/// ```
+#[doc = simple_mermaid::mermaid!("diagrams/adaptor.mmd")]
 pub trait HyperClientAdaptor<M>
 where
     M: 'static

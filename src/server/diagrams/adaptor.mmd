@@ -1,0 +1,6 @@
+graph LR
+    IN[Input HTTP server]
+    ProSA[ProSA Hyper Processor]
+
+    IN-- HTTP request (process_http_request) -->ProSA
+    ProSA-- HTTP response -->IN
