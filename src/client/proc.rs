@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use prosa::{
     core::{
@@ -37,7 +37,7 @@ pub struct HyperClientSettings {
     pub backends: Vec<TargetSetting>,
     /// Number of socket connections per target, at least one
     #[serde(default = "HyperClientSettings::default_nb_socket")]
-    nb_socket: u32,
+    nb_socket: NonZeroU32,
     /// Timeout for HTTP messages in milliseconds
     #[serde(default = "HyperClientSettings::default_http_timeout")]
     http_timeout: u64,
@@ -51,8 +51,8 @@ pub struct HyperClientSettings {
 }
 
 impl HyperClientSettings {
-    fn default_nb_socket() -> u32 {
-        1
+    fn default_nb_socket() -> NonZeroU32 {
+        NonZeroU32::MIN
     }
 
     fn default_http_timeout() -> u64 {
@@ -83,10 +83,10 @@ impl HyperClientSettings {
     /// Number of socket connections the processor keeps open per backend.
     ///
     /// Never zero, a client without socket can't serve anything, so a configuration asking for none
-    /// is read as asking for one. Every reader goes through here, which is what keeps the processor
-    /// and its sockets from disagreeing on how many sockets should exist
-    pub(crate) fn nb_socket(&self) -> u32 {
-        self.nb_socket.max(1)
+    /// is rejected when deserialized. Every reader goes through here, which is what keeps the
+    /// processor and its sockets from disagreeing on how many sockets should exist
+    pub(crate) fn nb_socket(&self) -> NonZeroU32 {
+        self.nb_socket
     }
 
     /// Timeout applied to HTTP messages
@@ -139,8 +139,9 @@ const SOCKET_QUEUE_SIZE: usize = 2048;
 struct SocketHandle {
     /// Bus queue id of the socket, stable across its reconnections
     id: u32,
-    /// Backend the socket connects to, and its position in the pool of that backend
+    /// Backend the socket connects to
     target: TargetSetting,
+    /// Position in the pool of the backend the socket connects to
     index: u32,
     /// Service the socket advertises, so renaming it replaces the whole pool
     service_name: String,
@@ -166,7 +167,7 @@ impl SocketHandle {
     /// and the connection timeout aren't part of it: they apply to the next attempt and to the next
     /// request, so they reach the socket through its control channel instead
     fn matching_backend<'s>(&self, settings: &'s HyperClientSettings) -> Option<&'s TargetSetting> {
-        if self.index >= settings.nb_socket() || self.service_name != settings.service_name {
+        if self.index >= settings.nb_socket().get() || self.service_name != settings.service_name {
             return None;
         }
 
@@ -264,11 +265,11 @@ where
         // And spawn the ones that are missing. Matched the same way the sockets were kept, so a
         // backend that only changed its connection timeout doesn't get a second pool
         for target in &settings.backends {
-            for index in 0..settings.nb_socket() {
+            for index in 0..settings.nb_socket().get() {
                 if !self.handles.iter().any(|handle| {
                     handle.index == index && SocketHandle::same_connection(&handle.target, target)
                 }) {
-                    self.spawn(target.clone(), index, settings, proc, adaptor);
+                    self.spawn(target.clone(), index, settings, proc.clone(), adaptor.clone());
                 }
             }
         }
@@ -280,8 +281,8 @@ where
         target: TargetSetting,
         index: u32,
         settings: &HyperClientSettings,
-        proc: &Arc<ProcParam<M>>,
-        adaptor: &Arc<A>,
+        proc: Arc<ProcParam<M>>,
+        adaptor: Arc<A>,
     ) where
         A: 'static + Adaptor + HyperClientAdaptor<M> + std::marker::Send + std::marker::Sync,
     {
@@ -303,8 +304,8 @@ where
         )
         .spawn(
             &mut self.tasks,
-            proc.clone(),
-            adaptor.clone(),
+            proc,
+            adaptor,
             settings,
             self.meters.clone(),
         );
@@ -320,7 +321,7 @@ where
     }
 
     /// Take back a socket task that just ended, and start its slot again if it is still open
-    fn take_back<A>(
+    async fn take_back<A>(
         &mut self,
         ended: Result<(HyperClientSocket<M>, Option<HyperProcError>), JoinError>,
         settings: &HyperClientSettings,
@@ -340,7 +341,20 @@ where
             // so the slot is closed here and opened again below, with a socket of its own
             Err(error) => {
                 warn!("A Hyper client socket task panicked, closing its slot: {error}");
-                self.handles.retain(|handle| handle.task != error.id());
+                if let Some(slot) = self
+                    .handles
+                    .iter()
+                    .position(|handle| handle.task == error.id())
+                {
+                    // The bus still routes to the queue the task dropped, and its id won't be reused
+                    let id = self.handles.swap_remove(slot).id;
+                    if let Err(e) = proc.remove_proc_queue(id).await {
+                        debug!(
+                            socket_id = id,
+                            "Can't remove the panicked Hyper client socket queue from the bus: {e}"
+                        );
+                    }
+                }
                 // Opened again unless ProSA is on its way out, where `handles` is already empty and
                 // realigning would connect the whole pool back to the backends
                 if !proc.is_stopping() {
@@ -494,7 +508,7 @@ where
                 Some(socket) = pool.join_next(), if pool.is_running() => {
                     // The socket is given back whatever ended it, so a failed connection is retried
                     // instead of shrinking the pool until the next configuration reload
-                    pool.take_back(socket, &self.settings, &self.proc, &adaptor);
+                    pool.take_back(socket, &self.settings, &self.proc, &adaptor).await;
                 },
             }
         }

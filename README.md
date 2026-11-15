@@ -61,6 +61,7 @@ hyper_client:
 ```
 
 `nb_socket` is how many connections the processor keeps open to each backend (one by default).
+It must be at least one: a configuration with `nb_socket: 0` is rejected.
 An HTTP/1.1 socket serves one request at a time, so it is worth raising against a plain backend;
 an HTTP/2 one multiplexes them.
 
