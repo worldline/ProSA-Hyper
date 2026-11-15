@@ -269,7 +269,13 @@ where
                 if !self.handles.iter().any(|handle| {
                     handle.index == index && SocketHandle::same_connection(&handle.target, target)
                 }) {
-                    self.spawn(target.clone(), index, settings, proc.clone(), adaptor.clone());
+                    self.spawn(
+                        target.clone(),
+                        index,
+                        settings,
+                        proc.clone(),
+                        adaptor.clone(),
+                    );
                 }
             }
         }
