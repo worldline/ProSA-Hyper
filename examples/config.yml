@@ -13,8 +13,7 @@ hyper_client:
       ssl:
         store:
           path: "examples/"
-  min_socket: 2
-  max_socket: 20
+  nb_socket: 2
 
 observability:
   level: DEBUG
