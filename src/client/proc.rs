@@ -1,4 +1,8 @@
-use std::{num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    sync::Arc,
+    time::Duration,
+};
 
 use prosa::{
     core::{
@@ -38,9 +42,9 @@ pub struct HyperClientSettings {
     /// Number of socket connections per target, at least one
     #[serde(default = "HyperClientSettings::default_nb_socket")]
     nb_socket: NonZeroU32,
-    /// Timeout for HTTP messages in milliseconds
+    /// Timeout for HTTP messages in milliseconds, never zero
     #[serde(default = "HyperClientSettings::default_http_timeout")]
-    http_timeout: u64,
+    http_timeout: NonZeroU64,
     /// Delay before reconnecting a socket that just failed, in milliseconds.
     /// It doubles on every consecutive failure, up to `max_reconnect_delay`
     #[serde(default = "HyperClientSettings::default_reconnect_delay")]
@@ -55,8 +59,8 @@ impl HyperClientSettings {
         NonZeroU32::MIN
     }
 
-    fn default_http_timeout() -> u64 {
-        5000
+    fn default_http_timeout() -> NonZeroU64 {
+        const { NonZeroU64::new(5000).expect("Default HTTP timeout should not be zero") }
     }
 
     fn default_reconnect_delay() -> u64 {
@@ -89,9 +93,12 @@ impl HyperClientSettings {
         self.nb_socket
     }
 
-    /// Timeout applied to HTTP messages
+    /// Timeout applied to HTTP messages.
+    ///
+    /// Never zero, a zero timeout would fail every request that isn't ready on its first poll, so a
+    /// configuration asking for it is rejected when deserialized
     pub(crate) fn http_timeout(&self) -> Duration {
-        Duration::from_millis(self.http_timeout)
+        Duration::from_millis(self.http_timeout.get())
     }
 
     /// How a socket spaces out its reconnection attempts to a backend that is down.
@@ -592,5 +599,21 @@ mod tests {
             Backoff::new(Duration::from_millis(500), Duration::from_secs(30)),
             HyperClientSettings::new("hyper".into()).backoff()
         );
+    }
+
+    #[test]
+    fn zero_http_timeout_is_rejected() {
+        let settings: Result<HyperClientSettings, _> = config::Config::builder()
+            .set_override("http_timeout", 0)
+            .expect("HTTP timeout override should be valid")
+            .set_override("service_name", "hyper")
+            .expect("Service name override should be valid")
+            .set_override("backends", Vec::<String>::new())
+            .expect("Backends override should be valid")
+            .build()
+            .expect("Configuration should be valid")
+            .try_deserialize();
+
+        assert!(settings.is_err());
     }
 }
