@@ -1,26 +1,23 @@
 //! Hyper service definition
 
-use std::convert::Infallible;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use bytes::Bytes;
 use http::StatusCode;
-use http_body_util::combinators::BoxBody;
-use http_body_util::{Empty, Full};
-use hyper::service::Service;
-use hyper::{Request, Response};
-use opentelemetry::KeyValue;
-use opentelemetry::metrics::Counter;
-use prosa::core::msg::{InternalMsg, Msg, RequestMsg};
+use http_body_util::{Empty, Full, combinators::BoxBody};
+use hyper::{Request, service::Service};
+use prosa::{
+    core::msg::{InternalMsg, Msg, RequestMsg},
+    otel::{KeyValue, metrics::Counter},
+};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{HttpError, hyper_version_str};
+use crate::{
+    HttpError, hyper_version_str,
+    server::{HttpResponse, adaptor::HyperServerAdaptor},
+};
 
-use super::adaptor::HyperServerAdaptor;
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 /// Struct to define parameters for a service (HTTP server)
 pub(crate) struct HyperService<A, M>
 where
@@ -41,7 +38,7 @@ where
 
 impl<A, M> HyperService<A, M>
 where
-    A: 'static + HyperServerAdaptor<M> + Clone + std::marker::Sync + std::marker::Send,
+    A: 'static + HyperServerAdaptor<M> + std::marker::Sync + std::marker::Send,
     M: 'static
         + std::marker::Send
         + std::marker::Sync
@@ -69,11 +66,19 @@ where
         proc_queue: mpsc::Sender<RequestMsg<M>>,
         req: Request<hyper::body::Incoming>,
         metric_counter: Counter<u64>,
-    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError> {
+    ) -> Result<HttpResponse, HttpError> {
         match adaptor.process_http_request(req).await {
-            crate::HyperResp::SrvReq(srv_name, req, handler) => {
+            super::HyperResp::SrvReq {
+                service_name,
+                request,
+                handler,
+            } => {
                 let resp = HyperService::<A, M>::wait_intern_resp(
-                    adaptor, proc_queue, srv_name, req, handler,
+                    adaptor,
+                    proc_queue,
+                    service_name,
+                    request,
+                    handler,
                 )
                 .await;
                 if let Ok(ref res) = resp {
@@ -87,7 +92,7 @@ where
                 }
                 resp
             }
-            crate::HyperResp::HttpResp(res) => {
+            super::HyperResp::HttpResp(res) => {
                 metric_counter.add(
                     1,
                     &[
@@ -97,7 +102,7 @@ where
                 );
                 Ok(res)
             }
-            crate::HyperResp::HttpErr(err) => {
+            super::HyperResp::HttpErr(err) => {
                 metric_counter.add(1, &[KeyValue::new("code", 503)]);
                 Err(err)
             }
@@ -110,8 +115,8 @@ where
         proc_queue: mpsc::Sender<RequestMsg<M>>,
         service_name: String,
         request: M,
-        handler: crate::SrvRespHandler<A, M>,
-    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError> {
+        handler: super::SrvRespHandler<A, M>,
+    ) -> Result<HttpResponse, HttpError> {
         let (resp_tx, resp_rx) = oneshot::channel::<InternalMsg<M>>();
         let _ = proc_queue
             .send(RequestMsg::new(service_name, request, resp_tx))
@@ -144,7 +149,7 @@ where
 
 impl<A, M> Service<Request<hyper::body::Incoming>> for HyperService<A, M>
 where
-    A: 'static + HyperServerAdaptor<M> + Clone + std::marker::Sync + std::marker::Send,
+    A: 'static + HyperServerAdaptor<M> + std::marker::Sync + std::marker::Send,
     M: 'static
         + std::marker::Send
         + std::marker::Sized
@@ -154,7 +159,7 @@ where
         + std::default::Default
         + std::marker::Sync,
 {
-    type Response = Response<BoxBody<Bytes, Infallible>>;
+    type Response = HttpResponse;
     type Error = HttpError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 

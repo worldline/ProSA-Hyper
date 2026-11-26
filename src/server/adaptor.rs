@@ -1,27 +1,21 @@
 //! Hyper server adaptor definition
-use std::convert::Infallible;
-
 use bytes::Bytes;
 use http::response;
 use http_body_util::{Empty, Full, combinators::BoxBody};
 use hyper::{Request, Response, StatusCode};
-use prosa::core::{adaptor::Adaptor, error::ProcError, msg::ErrorMsg, proc::ProcBusParam as _};
+use prosa::{
+    core::{adaptor::Adaptor, error::ProcError, msg::ErrorMsg, proc::ProcBusParam as _},
+    io::SocketAddr,
+};
 
-use crate::{HttpError, HyperResp, PRODUCT_VERSION_HEADER};
+use crate::{
+    HttpError, PRODUCT_VERSION_HEADER,
+    server::{HttpResponse, HyperResp, proc::HyperServerProc},
+};
 
-use super::proc::HyperServerProc;
-
-#[cfg_attr(doc, aquamarine::aquamarine)]
 /// Trait to define the Hyper server adaptor structure
 ///
-/// ```mermaid
-/// graph LR
-///     IN[Input HTTP server]
-///     ProSA[ProSA Hyper Procesor]
-///
-///     IN-- HTTP request (process_server_request) -->ProSA
-///     ProSA-- HTTP response (process_server_response) -->IN
-/// ```
+#[doc = simple_mermaid::mermaid!("diagrams/adaptor.mmd")]
 pub trait HyperServerAdaptor<M>
 where
     M: 'static
@@ -33,8 +27,15 @@ where
         + prosa::core::msg::Tvf
         + std::default::Default,
 {
-    /// Create a new adaptor
-    fn new(proc: &HyperServerProc<M>) -> Result<Self, Box<dyn ProcError + Send + Sync>>
+    /// Create a new adaptor.
+    ///
+    /// `addr` is the address the processor bound at startup. It is not always the one configured:
+    /// a listener asking for the port 0 only knows where it landed once bound. A configuration
+    /// reload that moves the listener reuses the same adaptor, so it doesn't refresh `addr`
+    fn new(
+        proc: &HyperServerProc<M>,
+        addr: SocketAddr,
+    ) -> Result<Self, Box<dyn ProcError + Send + Sync>>
     where
         Self: Sized;
 
@@ -79,7 +80,7 @@ where
 pub fn default_srv_error_response<M, F>(
     err: &ErrorMsg<M>,
     response_builder: F,
-) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError>
+) -> Result<HttpResponse, HttpError>
 where
     M: 'static
         + std::marker::Send
@@ -130,7 +131,10 @@ where
         + prosa::core::msg::Tvf
         + std::default::Default,
 {
-    fn new(proc: &HyperServerProc<M>) -> Result<Self, Box<dyn ProcError + Send + Sync>> {
+    fn new(
+        proc: &HyperServerProc<M>,
+        _addr: SocketAddr,
+    ) -> Result<Self, Box<dyn ProcError + Send + Sync>> {
         Ok(HelloHyperServerAdaptor {
             hello_msg: format!("Hello from {}", proc.name()),
         })
