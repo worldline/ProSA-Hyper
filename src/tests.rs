@@ -15,8 +15,6 @@ use prosa_utils::config::{ConfigError, os_country, ssl::SslConfig};
 use serde::Serialize;
 use std::{fs::File, io::Write as _, num::TryFromIntError};
 
-use crate::{client::proc::HyperClientSettings, server::proc::HyperServerSettings};
-
 /// HTTP settings for tests
 #[settings]
 #[derive(Default, Debug, Serialize)]
@@ -24,9 +22,9 @@ pub(crate) struct HttpTestSettings {
     pub(crate) stub: StubSettings,
     pub(crate) inj: InjSettings,
     #[cfg(feature = "server")]
-    pub(crate) server: HyperServerSettings,
+    pub(crate) server: crate::server::proc::HyperServerSettings,
     #[cfg(feature = "client")]
-    pub(crate) client: HyperClientSettings,
+    pub(crate) client: crate::client::proc::HyperClientSettings,
 }
 
 impl HttpTestSettings {
@@ -119,13 +117,14 @@ impl HttpTestSettings {
             stub: StubSettings::new(vec!["STUB_HTTP_SRV".to_string()]),
             inj: InjSettings::new("HTTP_CLIENT_SRV".to_string()),
             #[cfg(feature = "server")]
-            server: HyperServerSettings::new(
+            server: crate::server::proc::HyperServerSettings::new(
                 prosa::io::listener::ListenerSetting::new(url.clone(), server_ssl),
                 std::time::Duration::from_secs(1),
             ),
             #[cfg(feature = "client")]
             client: {
-                let mut client = HyperClientSettings::new("HTTP_CLIENT_SRV".to_string());
+                let mut client =
+                    crate::client::proc::HyperClientSettings::new("HTTP_CLIENT_SRV".to_string());
                 client.add_backend(prosa::io::stream::TargetSetting::new(
                     url.clone(),
                     client_ssl,
@@ -270,9 +269,10 @@ mod tests {
     use url::Url;
 
     use crate::{
-        HyperResp, PRODUCT_VERSION_HEADER,
+        PRODUCT_VERSION_HEADER,
         client::{adaptor::HyperClientAdaptor, proc::HyperClientProc},
         server::{
+            HyperResp,
             adaptor::{HyperServerAdaptor, default_srv_error_response},
             proc::HyperServerProc,
         },

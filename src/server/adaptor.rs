@@ -10,7 +10,10 @@ use prosa::{
     io::SocketAddr,
 };
 
-use crate::{HttpError, HyperResp, PRODUCT_VERSION_HEADER, server::proc::HyperServerProc};
+use crate::{
+    HttpError, PRODUCT_VERSION_HEADER,
+    server::{HyperResp, proc::HyperServerProc},
+};
 
 /// Trait to define the Hyper server adaptor structure
 ///

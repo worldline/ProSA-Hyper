@@ -65,7 +65,7 @@ where
         metric_counter: Counter<u64>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError> {
         match adaptor.process_http_request(req).await {
-            crate::HyperResp::SrvReq(srv_name, req, handler) => {
+            super::HyperResp::SrvReq(srv_name, req, handler) => {
                 let resp = HyperService::<A, M>::wait_intern_resp(
                     adaptor, proc_queue, srv_name, req, handler,
                 )
@@ -81,7 +81,7 @@ where
                 }
                 resp
             }
-            crate::HyperResp::HttpResp(res) => {
+            super::HyperResp::HttpResp(res) => {
                 metric_counter.add(
                     1,
                     &[
@@ -91,7 +91,7 @@ where
                 );
                 Ok(res)
             }
-            crate::HyperResp::HttpErr(err) => {
+            super::HyperResp::HttpErr(err) => {
                 metric_counter.add(1, &[KeyValue::new("code", 503)]);
                 Err(err)
             }
@@ -104,7 +104,7 @@ where
         proc_queue: mpsc::Sender<RequestMsg<M>>,
         service_name: String,
         request: M,
-        handler: crate::SrvRespHandler<A, M>,
+        handler: super::SrvRespHandler<A, M>,
     ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError> {
         let (resp_tx, resp_rx) = oneshot::channel::<InternalMsg<M>>();
         let _ = proc_queue

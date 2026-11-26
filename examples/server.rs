@@ -21,8 +21,9 @@ use prosa::{
     tracing::debug,
 };
 use prosa_hyper::{
-    HyperResp, PRODUCT_VERSION_HEADER,
+    PRODUCT_VERSION_HEADER,
     server::{
+        HyperResp,
         adaptor::{HyperServerAdaptor, default_srv_error_response},
         proc::{HyperServerProc, HyperServerSettings},
     },
@@ -59,7 +60,7 @@ where
     async fn process_http_request(
         &self,
         req: Request<hyper::body::Incoming>,
-    ) -> crate::HyperResp<Self, M> {
+    ) -> HyperResp<Self, M> {
         match req.uri().path() {
             "/" => Response::builder()
                 .header("Server", PRODUCT_VERSION_HEADER)
