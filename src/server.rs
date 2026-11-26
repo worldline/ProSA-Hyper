@@ -16,17 +16,15 @@ use prosa::core::msg::ErrorMsg;
 
 use crate::HttpError;
 
+/// HTTP response sent back by the Hyper server processor
+pub type HttpResponse = Response<BoxBody<Bytes, Infallible>>;
+
 /// Type alias for the closure that processes an internal service response or error.
 ///
 /// Receives `Ok(M)` on success or `Err(ErrorMsg<M>)` on service error.
 /// Returns an HTTP response or an HTTP error.
-pub type SrvRespHandler<A, M> = Box<
-    dyn FnOnce(
-            &A,
-            Result<M, ErrorMsg<M>>,
-        ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError>
-        + Send,
->;
+pub type SrvRespHandler<A, M> =
+    Box<dyn FnOnce(&A, Result<M, ErrorMsg<M>>) -> Result<HttpResponse, HttpError> + Send>;
 
 /// Enum to define all type of response to request it can be made
 pub enum HyperResp<A, M>
@@ -42,9 +40,16 @@ where
         + std::default::Default,
 {
     /// Make an internal service request and process the response with the provided handler
-    SrvReq(String, M, SrvRespHandler<A, M>),
+    SrvReq {
+        /// Name of the internal service to request
+        service_name: String,
+        /// Request sent to the internal service
+        request: M,
+        /// Handler turning the internal service response or error into an HTTP response
+        handler: SrvRespHandler<A, M>,
+    },
     /// Make a direct HTTP response
-    HttpResp(Response<BoxBody<Bytes, Infallible>>),
+    HttpResp(HttpResponse),
     /// Response with an HTTP error
     HttpErr(HttpError),
 }
@@ -63,11 +68,15 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HyperResp::SrvReq(name, msg, _) => f
-                .debug_tuple("SrvReq")
-                .field(name)
-                .field(msg)
-                .field(&"<handler>")
+            HyperResp::SrvReq {
+                service_name,
+                request,
+                handler: _,
+            } => f
+                .debug_struct("SrvReq")
+                .field("service_name", service_name)
+                .field("request", request)
+                .field("handler", &"<handler>")
                 .finish(),
             HyperResp::HttpResp(resp) => f.debug_tuple("HttpResp").field(resp).finish(),
             HyperResp::HttpErr(err) => f.debug_tuple("HttpErr").field(err).finish(),
@@ -126,7 +135,7 @@ where
     }
 }
 
-impl<A, M> From<Result<Response<BoxBody<Bytes, Infallible>>, http::Error>> for HyperResp<A, M>
+impl<A, M> From<Result<HttpResponse, http::Error>> for HyperResp<A, M>
 where
     A: adaptor::HyperServerAdaptor<M>,
     M: 'static
@@ -138,7 +147,7 @@ where
         + prosa::core::msg::Tvf
         + std::default::Default,
 {
-    fn from(res: Result<Response<BoxBody<Bytes, Infallible>>, http::Error>) -> Self {
+    fn from(res: Result<HttpResponse, http::Error>) -> Self {
         match res {
             Ok(response) => Self::HttpResp(response),
             Err(err) => Self::HttpErr(HttpError::Http(err)),

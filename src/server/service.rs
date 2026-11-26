@@ -1,18 +1,21 @@
 //! Hyper service definition
 
-use std::{convert::Infallible, future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use bytes::Bytes;
 use http::StatusCode;
 use http_body_util::{Empty, Full, combinators::BoxBody};
-use hyper::{Request, Response, service::Service};
+use hyper::{Request, service::Service};
 use prosa::{
     core::msg::{InternalMsg, Msg, RequestMsg},
     otel::{KeyValue, metrics::Counter},
 };
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{HttpError, hyper_version_str, server::adaptor::HyperServerAdaptor};
+use crate::{
+    HttpError, hyper_version_str,
+    server::{HttpResponse, adaptor::HyperServerAdaptor},
+};
 
 #[derive(Debug)]
 /// Struct to define parameters for a service (HTTP server)
@@ -63,11 +66,19 @@ where
         proc_queue: mpsc::Sender<RequestMsg<M>>,
         req: Request<hyper::body::Incoming>,
         metric_counter: Counter<u64>,
-    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError> {
+    ) -> Result<HttpResponse, HttpError> {
         match adaptor.process_http_request(req).await {
-            super::HyperResp::SrvReq(srv_name, req, handler) => {
+            super::HyperResp::SrvReq {
+                service_name,
+                request,
+                handler,
+            } => {
                 let resp = HyperService::<A, M>::wait_intern_resp(
-                    adaptor, proc_queue, srv_name, req, handler,
+                    adaptor,
+                    proc_queue,
+                    service_name,
+                    request,
+                    handler,
                 )
                 .await;
                 if let Ok(ref res) = resp {
@@ -105,7 +116,7 @@ where
         service_name: String,
         request: M,
         handler: super::SrvRespHandler<A, M>,
-    ) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError> {
+    ) -> Result<HttpResponse, HttpError> {
         let (resp_tx, resp_rx) = oneshot::channel::<InternalMsg<M>>();
         let _ = proc_queue
             .send(RequestMsg::new(service_name, request, resp_tx))
@@ -148,7 +159,7 @@ where
         + std::default::Default
         + std::marker::Sync,
 {
-    type Response = Response<BoxBody<Bytes, Infallible>>;
+    type Response = HttpResponse;
     type Error = HttpError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 

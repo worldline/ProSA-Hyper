@@ -773,7 +773,7 @@ where
     /// if the task panicked instead of returning
     pub(super) fn spawn<A>(
         mut self,
-        join_set: &mut JoinSet<(Self, Option<HyperProcError>)>,
+        join_set: &mut JoinSet<Self>,
         proc: Arc<ProcParam<M>>,
         adaptor: Arc<A>,
         settings: &HyperClientSettings,
@@ -792,19 +792,22 @@ where
                 if self.control.is_stopped()
                     || self.wait_reconnect(reconnect_delay).await.is_break()
                 {
-                    return (self, None);
+                    return self;
                 }
 
                 let connected = self
                     .connect(&proc, &adaptor, &meters, backoff.healthy_connection())
                     .await;
+                if let Err(e) = &connected {
+                    warn!(socket_id = self.id, addr = %self.target, "Hyper client socket ended with error: {e}");
+                }
 
                 // Back off from a backend the socket couldn't get a working connection out of, whether
                 // it refused one or gave one it closed straight away. Both look the same to a caller,
                 // and reconnecting either without waiting is a loop at the speed of the machine
                 self.retry = backoff.next_retry(self.retry, matches!(connected, Ok(true)));
 
-                (self, connected.err())
+                self
             })
             .id()
     }

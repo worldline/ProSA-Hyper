@@ -1,6 +1,4 @@
 //! Hyper server adaptor definition
-use std::convert::Infallible;
-
 use bytes::Bytes;
 use http::response;
 use http_body_util::{Empty, Full, combinators::BoxBody};
@@ -12,7 +10,7 @@ use prosa::{
 
 use crate::{
     HttpError, PRODUCT_VERSION_HEADER,
-    server::{HyperResp, proc::HyperServerProc},
+    server::{HttpResponse, HyperResp, proc::HyperServerProc},
 };
 
 /// Trait to define the Hyper server adaptor structure
@@ -82,7 +80,7 @@ where
 pub fn default_srv_error_response<M, F>(
     err: &ErrorMsg<M>,
     response_builder: F,
-) -> Result<Response<BoxBody<Bytes, Infallible>>, HttpError>
+) -> Result<HttpResponse, HttpError>
 where
     M: 'static
         + std::marker::Send

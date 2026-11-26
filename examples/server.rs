@@ -78,10 +78,10 @@ where
                 let mut tvf_req = M::default();
                 tvf_req.put_string(1, req.method().to_string());
                 tvf_req.put_string(2, "/test");
-                HyperResp::SrvReq(
-                    String::from("SRV_TEST"),
-                    tvf_req,
-                    Box::new(move |adaptor, result| match result {
+                HyperResp::SrvReq {
+                    service_name: String::from("SRV_TEST"),
+                    request: tvf_req,
+                    handler: Box::new(move |adaptor, result| match result {
                         Ok(resp) => {
                             let body = resp
                                 .get_string(10)
@@ -101,7 +101,7 @@ where
                             )
                         }),
                     }),
-                )
+                }
             }
             _ => Response::builder()
                 .status(404)

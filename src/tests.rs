@@ -453,10 +453,10 @@ mod tests {
                 srv_req.put_string(1, body_str);
             }
 
-            HyperResp::SrvReq(
-                "STUB_HTTP_SRV".into(),
-                srv_req,
-                Box::new(move |adaptor, result| match result {
+            HyperResp::SrvReq {
+                service_name: "STUB_HTTP_SRV".into(),
+                request: srv_req,
+                handler: Box::new(move |adaptor, result| match result {
                     Ok(resp) => {
                         if let Ok(content) = resp.get_string(1) {
                             <TestAdaptor as HyperServerAdaptor<M>>::response_builder(
@@ -480,7 +480,7 @@ mod tests {
                         <TestAdaptor as HyperServerAdaptor<M>>::response_builder(adaptor, s)
                     }),
                 }),
-            )
+            }
         }
     }
 

@@ -192,7 +192,7 @@ where
 {
     /// Running socket tasks. A task ends when its connection does, and the socket it gives back is
     /// started again for as long as its slot is still in [`Self::handles`]
-    tasks: JoinSet<(HyperClientSocket<M>, Option<HyperProcError>)>,
+    tasks: JoinSet<HyperClientSocket<M>>,
     /// One per socket that should exist, which is the only thing saying a socket must come back
     handles: Vec<SocketHandle>,
     /// Slot ids are never reused, so a queue the bus hasn't removed yet can't be confused with the
@@ -229,10 +229,7 @@ where
     }
 
     /// Wait for the next socket task to end and hand its socket back
-    #[allow(clippy::type_complexity)]
-    async fn join_next(
-        &mut self,
-    ) -> Option<Result<(HyperClientSocket<M>, Option<HyperProcError>), JoinError>> {
+    async fn join_next(&mut self) -> Option<Result<HyperClientSocket<M>, JoinError>> {
         self.tasks.join_next().await
     }
 
@@ -336,7 +333,7 @@ where
     /// Take back a socket task that just ended, and start its slot again if it is still open
     async fn take_back<A>(
         &mut self,
-        ended: Result<(HyperClientSocket<M>, Option<HyperProcError>), JoinError>,
+        ended: Result<HyperClientSocket<M>, JoinError>,
         settings: &HyperClientSettings,
         proc: &Arc<ProcParam<M>>,
         adaptor: &Arc<A>,
@@ -344,11 +341,7 @@ where
         A: 'static + Adaptor + HyperClientAdaptor<M> + std::marker::Send + std::marker::Sync,
     {
         let socket = match ended {
-            Ok((socket, None)) => socket,
-            Ok((socket, Some(error))) => {
-                warn!("A Hyper client socket task ended with error: {error}");
-                socket
-            }
+            Ok(socket) => socket,
             // A task that panicked can't hand its socket back, and the queue it held went with it.
             // Taking the processor down over it would drop the queues of every other socket too,
             // so the slot is closed here and opened again below, with a socket of its own
@@ -417,7 +410,7 @@ where
 
         while let Some(socket) = self.tasks.join_next().await {
             match socket {
-                Ok((socket, _)) => socket.retire(),
+                Ok(socket) => socket.retire(),
                 Err(error) => warn!("A Hyper client socket task panicked while stopping: {error}"),
             }
         }
